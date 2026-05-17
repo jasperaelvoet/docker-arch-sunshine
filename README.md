@@ -36,6 +36,23 @@ make dev    # build, start, and attach
 make clean  # stop and remove persisted local data
 ```
 
+## Remote Host
+
+The remote host is treated as a test machine. Local files stay the source of
+truth.
+
+```sh
+make remote-dev      # sync, rebuild on remote, and attach
+make remote-sync     # sync files only
+make remote-watch    # keep syncing local edits to remote
+```
+
+Override the target if needed:
+
+```sh
+make remote-dev REMOTE=root@10.10.10.122 REMOTE_DIR=/root/docker-games
+```
+
 ## Defaults
 
 - Image/container: `docker-arch-sunshine`

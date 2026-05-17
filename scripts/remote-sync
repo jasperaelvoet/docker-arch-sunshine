@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE="${1:-once}"
+REMOTE="${REMOTE:-root@10.10.10.122}"
+REMOTE_DIR="${REMOTE_DIR:-/root/docker-games}"
+REMOTE_CONTAINER="${REMOTE_CONTAINER:-docker-arch-sunshine}"
+SYNC_INTERVAL="${SYNC_INTERVAL:-1}"
+SSH="${SSH:-ssh}"
+RSYNC="${RSYNC:-rsync}"
+
+usage() {
+  cat <<EOF
+Usage: scripts/remote-sync [once|rebuild|dev|watch]
+
+Environment overrides:
+  REMOTE=host              default: ${REMOTE}
+  REMOTE_DIR=path          default: ${REMOTE_DIR}
+  REMOTE_CONTAINER=name    default: ${REMOTE_CONTAINER}
+  REMOTE_REBUILD=1         rebuild remote container after each watch sync
+  SYNC_INTERVAL=seconds    default: ${SYNC_INTERVAL}
+EOF
+}
+
+sync_once() {
+  printf 'syncing to %s:%s\n' "${REMOTE}" "${REMOTE_DIR}"
+  "${SSH}" "${REMOTE}" "mkdir -p '${REMOTE_DIR}'"
+
+  if command -v "${RSYNC}" >/dev/null 2>&1 \
+    && "${SSH}" "${REMOTE}" "command -v rsync >/dev/null 2>&1"; then
+    "${RSYNC}" -az --delete \
+      --exclude '.git/' \
+      --exclude '.github/' \
+      --exclude '.DS_Store' \
+      --exclude '._*' \
+      --exclude '.vscode/' \
+      --exclude 'mnt/' \
+      --exclude 'data/' \
+      --exclude '*.log' \
+      --exclude '__pycache__/' \
+      --exclude '*.pyc' \
+      -e "${SSH}" \
+      ./ "${REMOTE}:${REMOTE_DIR}/"
+    return
+  fi
+
+  "${SSH}" "${REMOTE}" "cd '${REMOTE_DIR}' && rm -rf AGENTS.md Makefile README.md compose.yaml .dockerignore .gitattributes .gitignore build config scripts"
+  COPYFILE_DISABLE=1 tar \
+    --exclude './.git' \
+    --exclude './.github' \
+    --exclude './.DS_Store' \
+    --exclude './._*' \
+    --exclude './.vscode' \
+    --exclude './mnt' \
+    --exclude './data' \
+    --exclude './*.log' \
+    --exclude './__pycache__' \
+    --exclude './*.pyc' \
+    -cf - . \
+    | "${SSH}" "${REMOTE}" "cd '${REMOTE_DIR}' && tar -xf -"
+}
+
+remote_rebuild() {
+  printf 'rebuilding remote container\n'
+  "${SSH}" "${REMOTE}" "cd '${REMOTE_DIR}' && docker compose -f compose.yaml up -d --build sunshine"
+}
+
+remote_attach() {
+  printf 'attaching to %s\n' "${REMOTE_CONTAINER}"
+  "${SSH}" -t "${REMOTE}" "docker attach '${REMOTE_CONTAINER}'"
+}
+
+fingerprint() {
+  find . \
+    \( -path './.git' \
+      -o -path './.github' \
+      -o -path './.vscode' \
+      -o -path './mnt' \
+      -o -path './data' \
+      -o -path './__pycache__' \) -prune \
+    -o -type f \
+      ! -name '.DS_Store' \
+      ! -name '._*' \
+      ! -name '*.log' \
+      ! -name '*.pyc' \
+      -exec sh -c '
+        for file do
+          stat -f "%m %z %N" "$file" 2>/dev/null || stat -c "%Y %s %n" "$file"
+        done
+      ' sh {} + \
+    | sort
+}
+
+watch_loop() {
+  local current last
+
+  sync_once
+  if [ "${REMOTE_REBUILD:-0}" = "1" ]; then
+    remote_rebuild
+  fi
+
+  last="$(fingerprint)"
+  printf 'watching for local changes; ctrl-c to stop\n'
+
+  while sleep "${SYNC_INTERVAL}"; do
+    current="$(fingerprint)"
+    if [ "${current}" != "${last}" ]; then
+      last="${current}"
+      sync_once
+      if [ "${REMOTE_REBUILD:-0}" = "1" ]; then
+        remote_rebuild
+      fi
+    fi
+  done
+}
+
+case "${MODE}" in
+  once)
+    sync_once
+    ;;
+  rebuild)
+    sync_once
+    remote_rebuild
+    ;;
+  dev)
+    sync_once
+    remote_rebuild
+    remote_attach
+    ;;
+  watch)
+    watch_loop
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
