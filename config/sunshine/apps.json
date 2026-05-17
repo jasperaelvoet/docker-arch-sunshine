@@ -14,7 +14,9 @@
     "PULSE_SERVER": "unix:/run/user/1000/pulse/native",
     "MOZ_ENABLE_WAYLAND": "0",
     "SDL_VIDEODRIVER": "x11",
-    "STEAM_RUNTIME": "1"
+    "STEAM_RUNTIME": "1",
+    "SRT_URLOPEN_PREFER_STEAM": "1",
+    "STEAM_DISABLE_AUDIO_DEVICE_SWITCHING": "1"
   },
   "apps": [
     {

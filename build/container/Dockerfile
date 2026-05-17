@@ -91,7 +91,6 @@ RUN printf '\nDisableSandbox\n\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n
     && useradd -m -u 1000 -s /bin/bash -G wheel,video,input,render sunshine \
     && printf 'sunshine:sunshine\n' | chpasswd \
     && printf '%s\n' \
-      'sunshine ALL=(ALL) ALL' \
       'sunshine ALL=(root) NOPASSWD: /usr/local/bin/arch-sunshine session-start, /usr/local/bin/arch-sunshine session-start *, /usr/local/bin/arch-sunshine session-stop' \
       > /etc/sudoers.d/sunshine \
     && chmod 0440 /etc/sudoers.d/sunshine \
@@ -118,18 +117,30 @@ RUN sed -i '/^\[multilib\]$/,$ { /^LocalFileSigLevel = Never$/d; }' /etc/pacman.
 
 RUN sed -i 's/^#\(en_US\.UTF-8 UTF-8\)/\1/' /etc/locale.gen \
     && locale-gen \
-    && printf 'LANG=en_US.UTF-8\n' > /etc/locale.conf
+    && printf 'LANG=en_US.UTF-8\n' > /etc/locale.conf \
+    && dbus-uuidgen > /etc/machine-id
 
 COPY --chmod=755 build/container/bin/arch-sunshine-preseed-steam /usr/local/bin/arch-sunshine-preseed-steam
 RUN /usr/local/bin/arch-sunshine-preseed-steam
 
 COPY config/sunshine/ /usr/share/arch-sunshine/sunshine/
+COPY --chmod=755 build/container/bin/arch-sunshine-pacman /usr/local/bin/arch-sunshine-pacman
+COPY --chmod=755 build/container/bin/arch-sunshine-steam /usr/local/bin/arch-sunshine-steam
+COPY --chmod=755 build/container/bin/arch-sunshine-steamos-update /usr/local/bin/arch-sunshine-steamos-update
 COPY --chmod=755 build/container/bin/arch-sunshine /usr/local/bin/arch-sunshine
 COPY --chmod=755 build/container/bin/arch-sunshine-input-bridge /usr/local/bin/arch-sunshine-input-bridge
 
 RUN install -d -m 1777 /var/lib/xkb \
     && mkdir -p /mnt/user_data \
-    && chmod 1777 /tmp
+    && chmod 1777 /tmp \
+    && install -d -m 755 /usr/lib/arch-sunshine \
+    && mv /usr/bin/pacman /usr/lib/arch-sunshine/pacman.real \
+    && ln -sf /usr/local/bin/arch-sunshine-pacman /usr/bin/pacman \
+    && ln -sf /usr/local/bin/arch-sunshine-steam /usr/local/bin/steam \
+    && ln -sf /usr/local/bin/arch-sunshine-steamos-update /usr/bin/steamos-update \
+    && if [ -f /usr/share/applications/steam.desktop ]; then \
+      sed -i 's@Exec=/usr/bin/steam@Exec=/usr/local/bin/arch-sunshine-steam@g' /usr/share/applications/steam.desktop; \
+    fi
 
 EXPOSE 47984-47990/tcp
 EXPOSE 48010/tcp

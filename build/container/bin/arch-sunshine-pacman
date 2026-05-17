@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PACMAN_REAL=/usr/lib/arch-sunshine/pacman.real
+
+if [ "$#" -eq 0 ]; then
+  exec "${PACMAN_REAL}"
+fi
+
+case "$1" in
+  -Q*|--query|-V|--version|-h|--help)
+    exec "${PACMAN_REAL}" "$@"
+    ;;
+esac
+
+cat >&2 <<'EOF'
+Runtime package changes are disabled in Arch Sunshine.
+
+Edit build/container/Dockerfile and rebuild the image instead.
+Installed package queries still work with pacman -Q.
+EOF
+exit 1

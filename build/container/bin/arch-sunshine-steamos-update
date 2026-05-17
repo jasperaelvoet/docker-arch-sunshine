@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+for arg in "$@"; do
+  if [ "${arg}" = "--supports-duplicate-detection" ]; then
+    exit 0
+  fi
+done
+
+# Steam treats exit code 7 as "no OS update available".
+exit 7

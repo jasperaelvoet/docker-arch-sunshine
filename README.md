@@ -67,6 +67,15 @@ make remote-dev REMOTE=root@10.10.10.122 REMOTE_DIR=/root/docker-games
 - Web UI login: `sunshine` / `sunshine`
 - Persistent data: `./mnt/user_data`
 
+Runtime system changes are intentionally blocked. The container creates its own
+ephemeral writable runtime mounts, then remounts the root filesystem read-only
+when the Docker host supports it. On hosts that reject root overlay remounts,
+the entrypoint falls back to read-only system path mounts for package and OS
+state. User/session data stays under `/mnt/user_data`. Add or remove system
+packages in `build/container/Dockerfile`, then rebuild the image.
+Steam is seeded from the packaged bootstrap into persistent user data on first
+start; client updates and shader cache state stay under `/mnt/user_data`.
+
 The container uses the mounted GPU when available. On a headless GPU it runs
 KDE Plasma on GPU-backed Xwayland so Sunshine can still capture an X11 desktop.
 The lightweight X11 capture display stays up so Sunshine can initialize streams.

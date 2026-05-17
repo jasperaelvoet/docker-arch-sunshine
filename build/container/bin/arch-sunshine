@@ -34,7 +34,8 @@ SESSION_LOCK_DIR="${SESSION_RUNTIME_DIR}/session.lock.d"
 DISCONNECT_DESKTOP_FILE="${HOME_DIR}/.local/share/applications/arch-sunshine-disconnect.desktop"
 DISCONNECT_DESKTOP_ICON="${HOME_DIR}/Desktop/arch-sunshine-disconnect.desktop"
 DISCONNECT_PANEL_MARKER="${HOME_DIR}/.config/arch-sunshine-disconnect-panel-added"
-STEAM_SEED_DIR=/usr/share/arch-sunshine/steam/Steam
+HOME_OWNERSHIP_MARKER="${PERSISTENT_HOME_DIR}/.config/arch-sunshine/ownership-v2"
+STEAM_BOOTSTRAP_TAR=/usr/share/arch-sunshine/steam/bootstraplinux_ubuntu12_32.tar.xz
 WEB_UI_USER=sunshine
 WEB_UI_PASS=sunshine
 
@@ -67,6 +68,8 @@ run_as_desktop_user() {
     "PULSE_SERVER=unix:${RUNTIME_DIR}/pulse/native"
     "SDL_VIDEODRIVER=x11"
     "STEAM_RUNTIME=1"
+    "SRT_URLOPEN_PREFER_STEAM=1"
+    "STEAM_DISABLE_AUDIO_DEVICE_SWITCHING=1"
     "DISPLAY=${DISPLAY_NAME}"
   )
 
@@ -245,6 +248,19 @@ reset_session_vars() {
   DESKTOP_ACTIVE=0
 }
 
+ensure_persistent_home_ownership() {
+  mkdir -p "$(dirname "${HOME_OWNERSHIP_MARKER}")"
+
+  if [ -f "${HOME_OWNERSHIP_MARKER}" ]; then
+    chown "${DESKTOP_UID}:${DESKTOP_GID}" "${PERSISTENT_HOME_DIR}" "$(dirname "${HOME_OWNERSHIP_MARKER}")" 2>/dev/null || true
+    return 0
+  fi
+
+  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${PERSISTENT_HOME_DIR}"
+  printf '%s\n' "$(date -Is)" > "${HOME_OWNERSHIP_MARKER}"
+  chown "${DESKTOP_UID}:${DESKTOP_GID}" "${HOME_OWNERSHIP_MARKER}" "$(dirname "${HOME_OWNERSHIP_MARKER}")"
+}
+
 write_session_state() {
   install -d -m 755 "${SESSION_RUNTIME_DIR}"
   {
@@ -318,6 +334,95 @@ terminate_desktop_user_processes_named() {
   for pid in $(pgrep -u "${DESKTOP_UID}" -x "${name}" 2>/dev/null || true); do
     terminate_pid_tree "${pid}"
   done
+}
+
+mount_runtime_tmpfs() {
+  local mode="$2"
+  local target="$1"
+
+  mkdir -p "${target}"
+  if mountpoint -q "${target}"; then
+    chmod "${mode}" "${target}"
+    return 0
+  fi
+
+  mount -t tmpfs -o "mode=${mode}" tmpfs "${target}"
+  chmod "${mode}" "${target}"
+}
+
+setup_runtime_writable_mounts() {
+  mount_runtime_tmpfs /run 0755
+  mount_runtime_tmpfs /tmp 1777
+  mount_runtime_tmpfs /var/tmp 1777
+  mount_runtime_tmpfs /var/cache 0755
+  mount_runtime_tmpfs /var/lib/dbus 0755
+  mount_runtime_tmpfs /var/lib/xkb 1777
+  mount_runtime_tmpfs /var/log 0755
+}
+
+root_filesystem_is_read_only() {
+  awk '
+    $2 == "/" {
+      split($4, options, ",")
+      for (option in options) {
+        if (options[option] == "ro") {
+          found = 1
+        }
+      }
+    }
+    END { exit found ? 0 : 1 }
+  ' /proc/mounts
+}
+
+lock_root_filesystem() {
+  if root_filesystem_is_read_only; then
+    return 0
+  fi
+
+  sync
+  if mount -o remount,ro / >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log "Root filesystem remount is unsupported here; locking system paths read-only."
+  lock_system_paths_read_only
+}
+
+lock_read_only_path() {
+  local target="$1"
+
+  [ -d "${target}" ] || return 0
+
+  if ! mountpoint -q "${target}"; then
+    mount --bind "${target}" "${target}"
+  fi
+  mount -o remount,bind,ro "${target}"
+}
+
+lock_system_paths_read_only() {
+  local target
+  local targets=(
+    /usr
+    /etc
+    /opt
+    /boot
+    /root
+    /home
+    /var/lib/pacman
+    /var/spool
+    /srv
+  )
+
+  for target in "${targets[@]}"; do
+    lock_read_only_path "${target}"
+  done
+}
+
+ensure_machine_id() {
+  if [ ! -s /etc/machine-id ]; then
+    log "Image is missing /etc/machine-id; rebuild the image."
+    return 1
+  fi
 }
 
 acquire_session_lock() {
@@ -460,9 +565,12 @@ setup_user_data() {
     mv "${USER_DATA}/home/retro" "${PERSISTENT_HOME_DIR}"
   fi
 
-  mkdir -p "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}" "${PERSISTENT_HOME_DIR}" "${RUNTIME_DIR}" "${SESSION_RUNTIME_DIR}"
-  mkdir -p "${PERSISTENT_HOME_DIR}/.cache" "${PERSISTENT_HOME_DIR}/.config" "${PERSISTENT_HOME_DIR}/.local/share"
-  mkdir -p \
+  mkdir -p "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}" "${RUNTIME_DIR}" "${SESSION_RUNTIME_DIR}"
+  install -d -o "${DESKTOP_UID}" -g "${DESKTOP_GID}" "${PERSISTENT_HOME_DIR}"
+  install -d -o "${DESKTOP_UID}" -g "${DESKTOP_GID}" \
+    "${PERSISTENT_HOME_DIR}/.cache" \
+    "${PERSISTENT_HOME_DIR}/.config" \
+    "${PERSISTENT_HOME_DIR}/.local/share" \
     "${PERSISTENT_HOME_DIR}/Desktop" \
     "${PERSISTENT_HOME_DIR}/Documents" \
     "${PERSISTENT_HOME_DIR}/Downloads" \
@@ -472,10 +580,10 @@ setup_user_data() {
     "${PERSISTENT_HOME_DIR}/Public" \
     "${PERSISTENT_HOME_DIR}/Templates" \
     "${PERSISTENT_HOME_DIR}/Videos"
-  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${PERSISTENT_HOME_DIR}"
+  ensure_persistent_home_ownership
   bind_home_dir
 
-  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}" "${HOME_DIR}"
+  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}"
   chown "${DESKTOP_UID}:${DESKTOP_GID}" "${RUNTIME_DIR}"
   chmod 700 "${RUNTIME_DIR}"
   chmod 1777 /var/lib/xkb
@@ -486,9 +594,6 @@ setup_user_data() {
   chmod 666 /dev/uinput /dev/uhid 2>/dev/null || true
   chmod 666 /dev/dri/card* /dev/dri/renderD* 2>/dev/null || true
 
-  if [ ! -s /etc/machine-id ]; then
-    dbus-uuidgen > /etc/machine-id
-  fi
   mkdir -p /var/lib/dbus
   if [ ! -e /var/lib/dbus/machine-id ]; then
     cp /etc/machine-id /var/lib/dbus/machine-id
@@ -533,7 +638,14 @@ EOF
 [General]
 loginMode=emptySession
 EOF
-  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}" "${HOME_DIR}"
+  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" \
+    "${CONFIG_DIR}" \
+    "${STATE_DIR}" \
+    "${LOG_DIR}" \
+    "${HOME_DIR}/.cache" \
+    "${HOME_DIR}/.config" \
+    "${HOME_DIR}/.local/share/konsole" \
+    "${HOME_DIR}/Desktop"
 
   run_as_desktop_user xdg-user-dirs-update >/dev/null 2>&1 || true
   run_as_desktop_user kbuildsycoca6 --noincremental \
@@ -590,24 +702,10 @@ EOF
   chown "${DESKTOP_UID}:${DESKTOP_GID}" "${DISCONNECT_DESKTOP_FILE}" "${DISCONNECT_DESKTOP_ICON}"
 }
 
-rewrite_steam_seed_links() {
-  local link suffix target
-
-  while IFS= read -r -d '' link; do
-    target="$(readlink "${link}" 2>/dev/null || true)"
-    case "${target}" in
-      */.local/share/Steam/*)
-        suffix="${target#*/.local/share/Steam/}"
-        ln -sfn "${HOME_DIR}/.local/share/Steam/${suffix}" "${link}"
-        ;;
-    esac
-  done < <(find "${PERSISTENT_HOME_DIR}/.local/share/Steam" -type l -print0 2>/dev/null)
-}
-
 ensure_steam_links() {
   local steam_config="${PERSISTENT_HOME_DIR}/.steam"
 
-  mkdir -p "${steam_config}"
+  install -d -o "${DESKTOP_UID}" -g "${DESKTOP_GID}" "${steam_config}"
   ln -sfn "${HOME_DIR}/.local/share/Steam" "${steam_config}/steam"
   ln -sfn "${HOME_DIR}/.local/share/Steam" "${steam_config}/root"
   ln -sfn "${HOME_DIR}/.local/share/Steam/ubuntu12_32" "${steam_config}/bin32"
@@ -616,23 +714,53 @@ ensure_steam_links() {
   ln -sfn "${HOME_DIR}/.local/share/Steam/linux64" "${steam_config}/sdk64"
   ln -sfn "${HOME_DIR}/.steam/bin32" "${steam_config}/bin"
   rm -f "${steam_config}/steam.pid" "${steam_config}/steam.pipe" "${steam_config}/steam.token"
+  chown -h "${DESKTOP_UID}:${DESKTOP_GID}" "${steam_config}" "${steam_config}"/* 2>/dev/null || true
+}
+
+configure_steam_defaults() {
+  local steam_config="${PERSISTENT_HOME_DIR}/.steam"
+  local steam_dev_config="${PERSISTENT_HOME_DIR}/.local/share/Steam/steam_dev.cfg"
+  local steam_dir="${PERSISTENT_HOME_DIR}/.local/share/Steam"
+  local threads
+
+  install -d -o "${DESKTOP_UID}" -g "${DESKTOP_GID}" "${steam_dir}" "${steam_dir}/config"
+  touch "${steam_dir}/config/SteamAppData.vdf" 2>/dev/null || true
+
+  if [ ! -f "${steam_dev_config}" ] || ! grep -q '^unShaderBackgroundProcessingThreads ' "${steam_dev_config}"; then
+    threads=$(($(nproc) - 2))
+    if [ "${threads}" -gt 16 ]; then
+      threads=16
+    elif [ "${threads}" -lt 1 ]; then
+      threads=1
+    fi
+    printf 'unShaderBackgroundProcessingThreads %s\n' "${threads}" >> "${steam_dev_config}"
+  fi
+
+  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${steam_config}" 2>/dev/null || true
+  chown "${DESKTOP_UID}:${DESKTOP_GID}" \
+    "${steam_dir}" \
+    "${steam_dir}/config" \
+    "${steam_dir}/config/SteamAppData.vdf" \
+    "${steam_dev_config}" 2>/dev/null || true
 }
 
 seed_steam_install() {
   local steam_dir="${PERSISTENT_HOME_DIR}/.local/share/Steam"
 
-  if [ ! -x "${steam_dir}/steam.sh" ] && [ -x "${STEAM_SEED_DIR}/steam.sh" ]; then
-    log "Seeding Steam client into ${steam_dir}."
+  if [ ! -x "${steam_dir}/steam.sh" ] && [ -f "${STEAM_BOOTSTRAP_TAR}" ]; then
+    log "Bootstrapping Steam client into ${steam_dir}."
     rm -rf "${steam_dir}"
-    mkdir -p "$(dirname "${steam_dir}")"
-    cp -a "${STEAM_SEED_DIR}" "${steam_dir}"
-    rewrite_steam_seed_links
+    install -d -o "${DESKTOP_UID}" -g "${DESKTOP_GID}" "$(dirname "${steam_dir}")" "${steam_dir}"
+    if ! run_desktop_base tar -xJf "${STEAM_BOOTSTRAP_TAR}" -C "${HOME_DIR}/.local/share/Steam"; then
+      if [ ! -x "${steam_dir}/steam.sh" ]; then
+        return 1
+      fi
+      log "Steam bootstrap completed with filesystem warnings; continuing."
+    fi
   fi
 
-  if [ -d "${steam_dir}" ]; then
-    ensure_steam_links
-    chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${steam_dir}" "${PERSISTENT_HOME_DIR}/.steam"
-  fi
+  ensure_steam_links
+  configure_steam_defaults
 }
 
 write_desktop_env() {
@@ -651,6 +779,9 @@ export MOZ_ENABLE_WAYLAND=0
 export SDL_VIDEODRIVER=x11
 export LIBGL_DRI3_ENABLE=1
 export PULSE_SERVER=unix:${RUNTIME_DIR}/pulse/native
+export STEAM_RUNTIME=1
+export SRT_URLOPEN_PREFER_STEAM=1
+export STEAM_DISABLE_AUDIO_DEVICE_SWITCHING=1
 EOF
   chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${HOME_DIR}/.config"
 }
@@ -1829,7 +1960,7 @@ pair_device() {
 
 open_shell() {
   printf '\033[2J\033[H'
-  printf 'Container shell as %s. Password for sudo is %s. Type exit to return.\n\n' "${DESKTOP_USER}" "${DESKTOP_USER}"
+  printf 'Container shell as %s. Root sudo is limited to session controls. Type exit to return.\n\n' "${DESKTOP_USER}"
   run_as_desktop_user /bin/bash || true
 }
 
@@ -1869,6 +2000,15 @@ run_daemon_loop() {
 main() {
   reset_session_vars
   trap shutdown INT TERM EXIT
+  setup_runtime_writable_mounts || {
+    log "Runtime writable mount setup failed; immutable mode requires a privileged container."
+    exit 1
+  }
+  ensure_machine_id
+  lock_root_filesystem || {
+    log "Failed to remount the container root filesystem read-only."
+    exit 1
+  }
   setup_user_data
   seed_web_credentials
   set_session_geometry "${DEFAULT_WIDTH}" "${DEFAULT_HEIGHT}" "${DEFAULT_REFRESH_RATE}"

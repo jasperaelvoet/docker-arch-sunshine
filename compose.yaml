@@ -21,8 +21,3 @@ services:
       - "c 244:* rmw"
     volumes:
       - ./mnt/user_data:/mnt/user_data
-    tmpfs:
-      - /tmp
-      - /run
-      - /var/cache
-      - /var/lib/xkb
