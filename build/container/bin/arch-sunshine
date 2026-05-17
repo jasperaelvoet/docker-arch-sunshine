@@ -19,12 +19,14 @@ ACTIVE_DISPLAY_DRIVER="${DISPLAY_DRIVER}"
 CARD_NODE="${SUNSHINE_CARD_NODE:-/dev/dri/card0}"
 OUTPUT_NAME="${SUNSHINE_OUTPUT_NAME:-}"
 RENDER_NODE="${SUNSHINE_RENDER_NODE:-/dev/dri/renderD128}"
-DEFAULT_WIDTH="${SUNSHINE_WIDTH:-3840}"
-DEFAULT_HEIGHT="${SUNSHINE_HEIGHT:-2160}"
+DEFAULT_WIDTH="${SUNSHINE_WIDTH:-1920}"
+DEFAULT_HEIGHT="${SUNSHINE_HEIGHT:-1080}"
 DEFAULT_REFRESH_RATE="${SUNSHINE_FPS:-60}"
+DEFAULT_SCALE="${SUNSHINE_SCALE:-auto}"
 WIDTH="${DEFAULT_WIDTH}"
 HEIGHT="${DEFAULT_HEIGHT}"
 REFRESH_RATE="${DEFAULT_REFRESH_RATE}"
+SCALE=1
 XORG_CONFIG="${LOG_DIR}/xorg.conf"
 SESSION_RUNTIME_DIR=/run/arch-sunshine
 SESSION_STATE_FILE="${SESSION_RUNTIME_DIR}/session.env"
@@ -55,6 +57,7 @@ run_as_desktop_user() {
     "DESKTOP_SESSION=plasma"
     "KDE_SESSION_VERSION=6"
     "KDE_FULL_SESSION=true"
+    "KWIN_COMPOSE=N"
     "QT_QPA_PLATFORM=xcb"
     "LIBGL_DRI3_ENABLE=1"
     "PULSE_SERVER=unix:${RUNTIME_DIR}/pulse/native"
@@ -136,14 +139,92 @@ sanitize_refresh_rate() {
   printf '%s\n' "${value}"
 }
 
+sanitize_scale_request() {
+  local fallback="$2"
+  local value="$1"
+
+  if [ "${value}" = "auto" ]; then
+    printf '%s\n' "${value}"
+    return
+  fi
+
+  if [[ ! "${value}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    printf '%s\n' "${fallback}"
+    return
+  fi
+
+  awk -v value="${value}" -v fallback="${fallback}" '
+    BEGIN {
+      if (value < 0.5 || value > 4) {
+        print fallback
+      } else {
+        sub(/\.?0+$/, "", value)
+        print value
+      }
+    }
+  '
+}
+
+resolve_session_scale() {
+  local requested
+
+  requested="$(sanitize_scale_request "${1:-${DEFAULT_SCALE}}" auto)"
+  if [ "${requested}" != "auto" ]; then
+    printf '%s\n' "${requested}"
+    return
+  fi
+
+  if [ "${WIDTH}" -ge 3840 ] || [ "${HEIGHT}" -ge 2160 ]; then
+    printf '2\n'
+  elif [ "${WIDTH}" -ge 2880 ] || [ "${HEIGHT}" -ge 1800 ]; then
+    printf '1.75\n'
+  elif [ "${WIDTH}" -ge 2560 ] || [ "${HEIGHT}" -ge 1440 ]; then
+    printf '1.5\n'
+  elif [ "${WIDTH}" -ge 1921 ] || [ "${HEIGHT}" -ge 1200 ]; then
+    printf '1.25\n'
+  else
+    printf '1\n'
+  fi
+}
+
+scale_to_dpi() {
+  awk -v scale="${1:-1}" 'BEGIN { printf "%d\n", (96 * scale) + 0.5 }'
+}
+
 set_session_geometry() {
   WIDTH="$(sanitize_positive_int "${1:-${DEFAULT_WIDTH}}" "${DEFAULT_WIDTH}" 8192)"
   HEIGHT="$(sanitize_positive_int "${2:-${DEFAULT_HEIGHT}}" "${DEFAULT_HEIGHT}" 8192)"
   REFRESH_RATE="$(sanitize_refresh_rate "${3:-${DEFAULT_REFRESH_RATE}}" "${DEFAULT_REFRESH_RATE}")"
+  SCALE="$(resolve_session_scale "${4:-${DEFAULT_SCALE}}")"
 }
 
 xrandr_mode_name() {
   printf '%sx%s_%s\n' "${WIDTH}" "${HEIGHT}" "${REFRESH_RATE}"
+}
+
+xrandr_monitor_exists() {
+  local name="$1"
+
+  DISPLAY="${DISPLAY_NAME}" xrandr --listmonitors 2>/dev/null \
+    | awk -v name="${name}" '
+        NR > 1 {
+          monitor = $2
+          sub(/^[+*]+/, "", monitor)
+          if (monitor == name) {
+            found = 1
+          }
+        }
+        END { exit found ? 0 : 1 }
+      '
+}
+
+delete_xrandr_monitor() {
+  local name="$1"
+
+  if xrandr_monitor_exists "${name}"; then
+    DISPLAY="${DISPLAY_NAME}" xrandr --delmonitor "${name}" \
+      >>"${LOG_DIR}/xrandr.log" 2>&1 || true
+  fi
 }
 
 reset_session_vars() {
@@ -169,6 +250,7 @@ write_session_state() {
     printf 'WIDTH=%q\n' "${WIDTH}"
     printf 'HEIGHT=%q\n' "${HEIGHT}"
     printf 'REFRESH_RATE=%q\n' "${REFRESH_RATE}"
+    printf 'SCALE=%q\n' "${SCALE}"
     printf 'DESKTOP_ACTIVE=%q\n' "${DESKTOP_ACTIVE:-0}"
     printf 'XORG_PID=%q\n' "${XORG_PID:-}"
     printf 'XWAYLAND_PID=%q\n' "${XWAYLAND_PID:-}"
@@ -467,6 +549,7 @@ export XDG_SESSION_TYPE=x11
 export DESKTOP_SESSION=plasma
 export KDE_SESSION_VERSION=6
 export KDE_FULL_SESSION=true
+export KWIN_COMPOSE=N
 export QT_QPA_PLATFORM=xcb
 export MOZ_ENABLE_WAYLAND=0
 export SDL_VIDEODRIVER=x11
@@ -474,6 +557,90 @@ export LIBGL_DRI3_ENABLE=1
 export PULSE_SERVER=unix:${RUNTIME_DIR}/pulse/native
 EOF
   chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${HOME_DIR}/.config"
+}
+
+active_xrandr_output() {
+  DISPLAY="${DISPLAY_NAME}" xrandr --query 2>/dev/null \
+    | awk '/ connected/ { print $1; exit }'
+}
+
+write_kde_config_value() {
+  local file="$1"
+  local group="$2"
+  local key="$3"
+  local value="$4"
+
+  command -v kwriteconfig6 >/dev/null 2>&1 || return 1
+  run_desktop_base \
+    "XDG_CONFIG_HOME=${HOME_DIR}/.config" \
+    kwriteconfig6 \
+      --file "${file}" \
+      --group "${group}" \
+      --key "${key}" \
+      "${value}" >/dev/null 2>&1
+}
+
+write_kde_action_restrictions() {
+  local file="${HOME_DIR}/.config/kdeglobals"
+
+  write_kde_config_value kdeglobals "KDE Action Restrictions" "action/lock_screen" false || true
+  write_kde_config_value kdeglobals "KDE Action Restrictions" lock_screen false || true
+  write_kde_config_value kdeglobals "KDE Action Restrictions" logout false || true
+  write_kde_config_value kdeglobals "KDE Action Restrictions" "action/logout" false || true
+
+  if [ -f "${file}" ]; then
+    sed -i -E 's/^\[KDE Action Restrictions\]$/[KDE Action Restrictions][$i]/' "${file}"
+  fi
+}
+
+write_kde_session_config() {
+  local dpi output scale_factors
+
+  dpi="$(scale_to_dpi "${SCALE}")"
+  output="$(active_xrandr_output || true)"
+  if [ -z "${output}" ] || [ "${output}" = "none" ]; then
+    if [ "${ACTIVE_DISPLAY_DRIVER}" = "xwayland" ]; then
+      output=XWAYLAND0
+    else
+      output="${OUTPUT_NAME:-ArchSunshine}"
+    fi
+  fi
+  scale_factors="${output}=${SCALE};"
+
+  mkdir -p "${HOME_DIR}/.config"
+  write_kde_config_value kwinrc Compositing Enabled false || true
+  write_kde_config_value kdeglobals KScreen ScaleFactor "${SCALE}" || true
+  write_kde_config_value kdeglobals KScreen ScreenScaleFactors "${scale_factors}" || true
+  write_kde_config_value kdeglobals General Xft.dpi "${dpi}" || true
+  write_kde_config_value kcmfonts General forceFontDPI "${dpi}" || true
+  write_kde_action_restrictions
+  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${HOME_DIR}/.config"
+}
+
+apply_xrandr_dpi() {
+  local dpi
+
+  dpi="$(scale_to_dpi "${SCALE}")"
+  DISPLAY="${DISPLAY_NAME}" xrandr --dpi "${dpi}" \
+    >>"${LOG_DIR}/xrandr.log" 2>&1 || true
+}
+
+apply_desktop_scale_runtime() {
+  local output
+
+  write_kde_session_config
+  apply_xrandr_dpi
+
+  output="$(active_xrandr_output || true)"
+  if [ -n "${output}" ] && [ "${output}" != "none" ]; then
+    run_as_desktop_user kscreen-doctor "output.${output}.scale.${SCALE}" \
+      >"${LOG_DIR}/scale.log" 2>&1 || true
+  fi
+
+  run_as_desktop_user qdbus6 org.kde.KWin /KWin reconfigure \
+    >>"${LOG_DIR}/scale.log" 2>&1 || true
+  run_as_desktop_user qdbus6 org.kde.KWin /Compositor suspend \
+    >>"${LOG_DIR}/scale.log" 2>&1 || true
 }
 
 write_xorg_config() {
@@ -576,7 +743,7 @@ EOF
 }
 
 configure_xrandr_monitor() {
-  local height_mm mode_args mode_line mode_name output width_mm
+  local height_mm mode_args mode_line mode_name monitor_name output width_mm
 
   mode_name="$(xrandr_mode_name)"
   mode_line="$(cvt "${WIDTH}" "${HEIGHT}" "${REFRESH_RATE}" | awk '/Modeline/ {sub(/^Modeline /, ""); print}')"
@@ -612,10 +779,18 @@ configure_xrandr_monitor() {
     fi
   fi
 
-  DISPLAY="${DISPLAY_NAME}" xrandr --delmonitor ArchSunshine \
+  monitor_name=ArchSunshine
+  if [ "${output}" != "none" ]; then
+    monitor_name="${output}"
+  fi
+
+  delete_xrandr_monitor ArchSunshine
+  if [ "${monitor_name}" != "ArchSunshine" ]; then
+    delete_xrandr_monitor "${monitor_name}"
+  fi
+  DISPLAY="${DISPLAY_NAME}" xrandr --setmonitor "${monitor_name}" "${WIDTH}/${width_mm}x${HEIGHT}/${height_mm}+0+0" "${output}" \
     >>"${LOG_DIR}/xrandr.log" 2>&1 || true
-  DISPLAY="${DISPLAY_NAME}" xrandr --setmonitor ArchSunshine "${WIDTH}/${width_mm}x${HEIGHT}/${height_mm}+0+0" "${output}" \
-    >>"${LOG_DIR}/xrandr.log" 2>&1 || true
+  apply_xrandr_dpi
 }
 
 launch_xorg_process() {
@@ -954,7 +1129,9 @@ start_desktop_services() {
     start_input_bridge || return 1
   fi
 
-  launch_plasma_process
+  write_kde_session_config
+  launch_plasma_process || return 1
+  apply_desktop_scale_runtime
 }
 
 start_display() {
@@ -1110,11 +1287,12 @@ stop_desktop_runtime() {
 }
 
 session_start_locked() {
-  local requested_height requested_refresh requested_width
+  local requested_height requested_refresh requested_scale requested_width
 
   requested_width="$(sanitize_positive_int "${1:-${DEFAULT_WIDTH}}" "${DEFAULT_WIDTH}" 8192)"
   requested_height="$(sanitize_positive_int "${2:-${DEFAULT_HEIGHT}}" "${DEFAULT_HEIGHT}" 8192)"
   requested_refresh="$(sanitize_refresh_rate "${3:-${DEFAULT_REFRESH_RATE}}" "${DEFAULT_REFRESH_RATE}")"
+  requested_scale="$(sanitize_scale_request "${4:-${DEFAULT_SCALE}}" "${DEFAULT_SCALE}")"
 
   load_session_state >/dev/null 2>&1 || reset_session_vars
 
@@ -1123,11 +1301,12 @@ session_start_locked() {
     return 0
   fi
 
-  set_session_geometry "${requested_width}" "${requested_height}" "${requested_refresh}"
+  set_session_geometry "${requested_width}" "${requested_height}" "${requested_refresh}" "${requested_scale}"
   prepare_session_runtime
 
   if capture_display_live; then
     configure_xrandr_monitor
+    write_kde_session_config
   fi
 
   if ! capture_display_live || ! x_display_size_matches; then
@@ -1149,7 +1328,7 @@ session_start_locked() {
 
   DESKTOP_ACTIVE=1
   write_session_state
-  log "Desktop session started at ${WIDTH}x${HEIGHT}@${REFRESH_RATE} using ${ACTIVE_DISPLAY_DRIVER}."
+  log "Desktop session started at ${WIDTH}x${HEIGHT}@${REFRESH_RATE} scale ${SCALE} using ${ACTIVE_DISPLAY_DRIVER}."
 }
 
 session_start() {
@@ -1199,17 +1378,18 @@ session_stop() {
 }
 
 client_session_start() {
-  local requested_height requested_refresh requested_width
+  local requested_height requested_refresh requested_scale requested_width
 
   requested_width="${SUNSHINE_CLIENT_WIDTH:-${DEFAULT_WIDTH}}"
   requested_height="${SUNSHINE_CLIENT_HEIGHT:-${DEFAULT_HEIGHT}}"
   requested_refresh="${SUNSHINE_CLIENT_FPS:-${DEFAULT_REFRESH_RATE}}"
+  requested_scale="${SUNSHINE_CLIENT_SCALE:-${SUNSHINE_SCALE:-${DEFAULT_SCALE}}}"
 
   if [ "$(id -u)" -eq 0 ]; then
-    exec /usr/local/bin/arch-sunshine session-start "${requested_width}" "${requested_height}" "${requested_refresh}"
+    exec /usr/local/bin/arch-sunshine session-start "${requested_width}" "${requested_height}" "${requested_refresh}" "${requested_scale}"
   fi
 
-  exec /usr/bin/sudo -n /usr/local/bin/arch-sunshine session-start "${requested_width}" "${requested_height}" "${requested_refresh}"
+  exec /usr/bin/sudo -n /usr/local/bin/arch-sunshine session-start "${requested_width}" "${requested_height}" "${requested_refresh}" "${requested_scale}"
 }
 
 client_session_stop() {
@@ -1312,7 +1492,7 @@ draw_ui() {
   printf 'Arch Sunshine\n'
   printf '==============\n\n'
   printf 'Status\n'
-  printf '  Desktop   %s  KDE Plasma X11 %s on %s %sx%s@%s\n' "${display_state}" "${ACTIVE_DISPLAY_DRIVER}" "${DISPLAY_NAME}" "${WIDTH}" "${HEIGHT}" "${REFRESH_RATE}"
+  printf '  Desktop   %s  KDE Plasma X11 %s on %s %sx%s@%s scale %s\n' "${display_state}" "${ACTIVE_DISPLAY_DRIVER}" "${DISPLAY_NAME}" "${WIDTH}" "${HEIGHT}" "${REFRESH_RATE}" "${SCALE}"
   printf '  Sunshine  %s  https://<host-ip>:47990\n' "$(process_status "${SUNSHINE_PID:-}")"
   printf '  Capture   x11 on %s\n' "${DISPLAY_NAME}"
   printf '  User      %s / %s\n' "${DESKTOP_USER}" "${DESKTOP_USER}"

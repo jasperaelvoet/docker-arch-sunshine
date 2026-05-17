@@ -70,5 +70,7 @@ The lightweight X11 capture display stays up so Sunshine can initialize streams.
 KDE Plasma, audio, input bridge, and user applications are started by Sunshine
 when a Moonlight app starts, sized from the client's requested width, height, and
 FPS where the active display backend supports it, then stopped again when the app
-ends. The default capture display is 3840x2160 and can be overridden with
-`SUNSHINE_WIDTH` and `SUNSHINE_HEIGHT`.
+ends. Plasma scaling defaults to `auto`, derived from the requested stream
+resolution, and can be overridden with `SUNSHINE_SCALE` such as `1`, `1.5`, or
+`2`. The fallback capture display defaults to 1920x1080 before a client request
+is available, and can be overridden with `SUNSHINE_WIDTH` and `SUNSHINE_HEIGHT`.
