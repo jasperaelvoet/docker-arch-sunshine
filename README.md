@@ -11,6 +11,8 @@ for GPU-backed desktop capture on headless Linux hosts.
 - Steam and Firefox launchers
 - PipeWire/PulseAudio audio capture for streams
 - Persistent desktop, Steam, and Sunshine state in `./mnt/user_data`
+- Stream-triggered desktop wake/sleep so idle containers keep only Sunshine and
+  a lightweight X11 capture display up
 
 ## Requirements
 
@@ -64,3 +66,9 @@ make remote-dev REMOTE=root@10.10.10.122 REMOTE_DIR=/root/docker-games
 
 The container uses the mounted GPU when available. On a headless GPU it runs
 KDE Plasma on GPU-backed Xwayland so Sunshine can still capture an X11 desktop.
+The lightweight X11 capture display stays up so Sunshine can initialize streams.
+KDE Plasma, audio, input bridge, and user applications are started by Sunshine
+when a Moonlight app starts, sized from the client's requested width, height, and
+FPS where the active display backend supports it, then stopped again when the app
+ends. The default capture display is 3840x2160 and can be overridden with
+`SUNSHINE_WIDTH` and `SUNSHINE_HEIGHT`.

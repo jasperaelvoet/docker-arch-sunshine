@@ -19,9 +19,16 @@ ACTIVE_DISPLAY_DRIVER="${DISPLAY_DRIVER}"
 CARD_NODE="${SUNSHINE_CARD_NODE:-/dev/dri/card0}"
 OUTPUT_NAME="${SUNSHINE_OUTPUT_NAME:-}"
 RENDER_NODE="${SUNSHINE_RENDER_NODE:-/dev/dri/renderD128}"
-WIDTH="${SUNSHINE_WIDTH:-1920}"
-HEIGHT="${SUNSHINE_HEIGHT:-1080}"
+DEFAULT_WIDTH="${SUNSHINE_WIDTH:-3840}"
+DEFAULT_HEIGHT="${SUNSHINE_HEIGHT:-2160}"
+DEFAULT_REFRESH_RATE="${SUNSHINE_FPS:-60}"
+WIDTH="${DEFAULT_WIDTH}"
+HEIGHT="${DEFAULT_HEIGHT}"
+REFRESH_RATE="${DEFAULT_REFRESH_RATE}"
 XORG_CONFIG="${LOG_DIR}/xorg.conf"
+SESSION_RUNTIME_DIR=/run/arch-sunshine
+SESSION_STATE_FILE="${SESSION_RUNTIME_DIR}/session.env"
+SESSION_LOCK_DIR="${SESSION_RUNTIME_DIR}/session.lock.d"
 WEB_UI_USER=sunshine
 WEB_UI_PASS=sunshine
 
@@ -88,6 +95,149 @@ set_config_value() {
   else
     printf '%s = %s\n' "${key}" "${value}" >> "${file}"
   fi
+}
+
+sanitize_positive_int() {
+  local fallback="$2"
+  local max="$3"
+  local value="$1"
+
+  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "${fallback}"
+    return
+  fi
+
+  value=$((10#${value}))
+  if [ "${value}" -lt 1 ] || [ "${value}" -gt "${max}" ]; then
+    printf '%s\n' "${fallback}"
+    return
+  fi
+
+  printf '%s\n' "${value}"
+}
+
+sanitize_refresh_rate() {
+  local fallback="$2"
+  local integer_part
+  local value="$1"
+
+  if [[ ! "${value}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    printf '%s\n' "${fallback}"
+    return
+  fi
+
+  integer_part="${value%%.*}"
+  integer_part=$((10#${integer_part}))
+  if [ "${integer_part}" -lt 1 ] || [ "${integer_part}" -gt 240 ]; then
+    printf '%s\n' "${fallback}"
+    return
+  fi
+
+  printf '%s\n' "${value}"
+}
+
+set_session_geometry() {
+  WIDTH="$(sanitize_positive_int "${1:-${DEFAULT_WIDTH}}" "${DEFAULT_WIDTH}" 8192)"
+  HEIGHT="$(sanitize_positive_int "${2:-${DEFAULT_HEIGHT}}" "${DEFAULT_HEIGHT}" 8192)"
+  REFRESH_RATE="$(sanitize_refresh_rate "${3:-${DEFAULT_REFRESH_RATE}}" "${DEFAULT_REFRESH_RATE}")"
+}
+
+xrandr_mode_name() {
+  printf '%sx%s_%s\n' "${WIDTH}" "${HEIGHT}" "${REFRESH_RATE}"
+}
+
+reset_session_vars() {
+  XORG_PID=""
+  XWAYLAND_PID=""
+  WESTON_PID=""
+  PLASMA_PID=""
+  INPUT_BRIDGE_PID=""
+  WIREPLUMBER_PID=""
+  PIPEWIRE_PULSE_PID=""
+  PIPEWIRE_PID=""
+  SESSION_DBUS_PID=""
+  SYSTEM_DBUS_PID=""
+  DESKTOP_ACTIVE=0
+}
+
+write_session_state() {
+  install -d -m 755 "${SESSION_RUNTIME_DIR}"
+  {
+    printf 'ACTIVE_DISPLAY_DRIVER=%q\n' "${ACTIVE_DISPLAY_DRIVER}"
+    printf 'DISPLAY_DRIVER=%q\n' "${DISPLAY_DRIVER}"
+    printf 'OUTPUT_NAME=%q\n' "${OUTPUT_NAME}"
+    printf 'WIDTH=%q\n' "${WIDTH}"
+    printf 'HEIGHT=%q\n' "${HEIGHT}"
+    printf 'REFRESH_RATE=%q\n' "${REFRESH_RATE}"
+    printf 'DESKTOP_ACTIVE=%q\n' "${DESKTOP_ACTIVE:-0}"
+    printf 'XORG_PID=%q\n' "${XORG_PID:-}"
+    printf 'XWAYLAND_PID=%q\n' "${XWAYLAND_PID:-}"
+    printf 'WESTON_PID=%q\n' "${WESTON_PID:-}"
+    printf 'PLASMA_PID=%q\n' "${PLASMA_PID:-}"
+    printf 'INPUT_BRIDGE_PID=%q\n' "${INPUT_BRIDGE_PID:-}"
+    printf 'WIREPLUMBER_PID=%q\n' "${WIREPLUMBER_PID:-}"
+    printf 'PIPEWIRE_PULSE_PID=%q\n' "${PIPEWIRE_PULSE_PID:-}"
+    printf 'PIPEWIRE_PID=%q\n' "${PIPEWIRE_PID:-}"
+    printf 'SESSION_DBUS_PID=%q\n' "${SESSION_DBUS_PID:-}"
+    printf 'SYSTEM_DBUS_PID=%q\n' "${SYSTEM_DBUS_PID:-}"
+  } > "${SESSION_STATE_FILE}"
+}
+
+load_session_state() {
+  reset_session_vars
+
+  if [ ! -f "${SESSION_STATE_FILE}" ]; then
+    return 1
+  fi
+
+  # The state file is root-owned runtime data created by write_session_state.
+  . "${SESSION_STATE_FILE}"
+}
+
+terminate_pid() {
+  local pid="$1"
+
+  if [ -z "${pid}" ] || ! kill -0 "${pid}" 2>/dev/null; then
+    return 0
+  fi
+
+  kill "${pid}" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  kill -KILL "${pid}" 2>/dev/null || true
+}
+
+acquire_session_lock() {
+  local owner waited
+
+  waited=0
+  install -d -m 755 "${SESSION_RUNTIME_DIR}"
+
+  until mkdir "${SESSION_LOCK_DIR}" 2>/dev/null; do
+    owner="$(cat "${SESSION_LOCK_DIR}/pid" 2>/dev/null || true)"
+    if [ -n "${owner}" ] && ! kill -0 "${owner}" 2>/dev/null; then
+      rm -rf "${SESSION_LOCK_DIR}"
+      continue
+    fi
+
+    if [ "${waited}" -ge 300 ]; then
+      log "Timed out waiting for desktop session lock."
+      return 1
+    fi
+
+    waited=$((waited + 1))
+    sleep 0.1
+  done
+
+  printf '%s\n' "$$" > "${SESSION_LOCK_DIR}/pid"
+}
+
+release_session_lock() {
+  rm -rf "${SESSION_LOCK_DIR}"
 }
 
 bind_home_dir() {
@@ -201,7 +351,7 @@ setup_user_data() {
     mv "${USER_DATA}/home/retro" "${PERSISTENT_HOME_DIR}"
   fi
 
-  mkdir -p "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}" "${PERSISTENT_HOME_DIR}" "${RUNTIME_DIR}"
+  mkdir -p "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}" "${PERSISTENT_HOME_DIR}" "${RUNTIME_DIR}" "${SESSION_RUNTIME_DIR}"
   mkdir -p "${PERSISTENT_HOME_DIR}/.cache" "${PERSISTENT_HOME_DIR}/.config" "${PERSISTENT_HOME_DIR}/.local/share"
   mkdir -p \
     "${PERSISTENT_HOME_DIR}/Desktop" \
@@ -248,6 +398,8 @@ setup_user_data() {
   set_config_value stream_audio enabled
   set_config_value audio_sink arch_sunshine_audio.monitor
   set_config_value virtual_sink arch_sunshine_audio
+  set_config_value system_tray disabled
+  set_config_value global_prep_cmd '[{"do":"/usr/local/bin/arch-sunshine client-start","undo":"/usr/local/bin/arch-sunshine client-stop"}]'
   rm -f "${HOME_DIR}/.cache/ksycoca6"*
   rm -rf "${HOME_DIR}/.cache/menus"
   rm -rf "${HOME_DIR}/.local/share/kscreen"
@@ -331,8 +483,8 @@ write_xorg_config() {
 
   ACTIVE_DISPLAY_DRIVER="${driver}"
   write_desktop_env
-  mode_name="${WIDTH}x${HEIGHT}_60.00"
-  mode_line="$(cvt "${WIDTH}" "${HEIGHT}" 60 | awk '/Modeline/ {sub(/^Modeline /, ""); print}')"
+  mode_name="$(xrandr_mode_name)"
+  mode_line="$(cvt "${WIDTH}" "${HEIGHT}" "${REFRESH_RATE}" | awk '/Modeline/ {sub(/^Modeline /, ""); print}')"
   if [ -z "${mode_line}" ]; then
     mode_line="\"${mode_name}\" 173.00 ${WIDTH} $((WIDTH + 2048)) $((WIDTH + 2248)) $((WIDTH + 2576)) ${HEIGHT} $((HEIGHT + 3)) $((HEIGHT + 8)) $((HEIGHT + 38)) -hsync +vsync"
   fi
@@ -426,8 +578,8 @@ EOF
 configure_xrandr_monitor() {
   local height_mm mode_args mode_line mode_name output width_mm
 
-  mode_name="${WIDTH}x${HEIGHT}_60.00"
-  mode_line="$(cvt "${WIDTH}" "${HEIGHT}" 60 | awk '/Modeline/ {sub(/^Modeline /, ""); print}')"
+  mode_name="$(xrandr_mode_name)"
+  mode_line="$(cvt "${WIDTH}" "${HEIGHT}" "${REFRESH_RATE}" | awk '/Modeline/ {sub(/^Modeline /, ""); print}')"
   if [ -z "${mode_line}" ]; then
     mode_line="\"${mode_name}\" 173.00 ${WIDTH} $((WIDTH + 2048)) $((WIDTH + 2248)) $((WIDTH + 2576)) ${HEIGHT} $((HEIGHT + 3)) $((HEIGHT + 8)) $((HEIGHT + 38)) -hsync +vsync"
   fi
@@ -444,7 +596,7 @@ configure_xrandr_monitor() {
       >>"${LOG_DIR}/xrandr.log" 2>&1 || true
     DISPLAY="${DISPLAY_NAME}" xrandr --addmode "${OUTPUT_NAME}" "${mode_name}" \
       >>"${LOG_DIR}/xrandr.log" 2>&1 || true
-    DISPLAY="${DISPLAY_NAME}" xrandr --output "${OUTPUT_NAME}" --mode "${mode_name}" --primary \
+    DISPLAY="${DISPLAY_NAME}" xrandr --output "${OUTPUT_NAME}" --mode "${mode_name}" --rate "${REFRESH_RATE}" --primary \
       >>"${LOG_DIR}/xrandr.log" 2>&1 || true
     output="${OUTPUT_NAME}"
   elif [ "${ACTIVE_DISPLAY_DRIVER}" = "xwayland" ]; then
@@ -453,7 +605,7 @@ configure_xrandr_monitor() {
         | awk '/ connected/ { print $1; exit }'
     )"
     if [ -n "${output}" ]; then
-      DISPLAY="${DISPLAY_NAME}" xrandr --output "${output}" --mode "${WIDTH}x${HEIGHT}" --primary \
+      DISPLAY="${DISPLAY_NAME}" xrandr --output "${output}" --mode "${WIDTH}x${HEIGHT}" --rate "${REFRESH_RATE}" --primary \
         >>"${LOG_DIR}/xrandr.log" 2>&1 || true
     else
       output=none
@@ -554,9 +706,7 @@ launch_xwayland_process() {
 
 stop_xorg_process() {
   if [ -n "${XORG_PID:-}" ]; then
-    kill "${XORG_PID}" 2>/dev/null || true
-    wait "${XORG_PID}" 2>/dev/null || true
-    kill -KILL "${XORG_PID}" 2>/dev/null || true
+    terminate_pid "${XORG_PID}"
   fi
   XORG_PID=""
 
@@ -566,16 +716,12 @@ stop_xorg_process() {
 
 stop_xwayland_process() {
   if [ -n "${XWAYLAND_PID:-}" ]; then
-    kill "${XWAYLAND_PID}" 2>/dev/null || true
-    wait "${XWAYLAND_PID}" 2>/dev/null || true
-    kill -KILL "${XWAYLAND_PID}" 2>/dev/null || true
+    terminate_pid "${XWAYLAND_PID}"
   fi
   XWAYLAND_PID=""
 
   if [ -n "${WESTON_PID:-}" ]; then
-    kill "${WESTON_PID}" 2>/dev/null || true
-    wait "${WESTON_PID}" 2>/dev/null || true
-    kill -KILL "${WESTON_PID}" 2>/dev/null || true
+    terminate_pid "${WESTON_PID}"
   fi
   WESTON_PID=""
 
@@ -603,11 +749,11 @@ launch_plasma_process() {
 }
 
 stop_display_processes() {
-  [ -n "${PLASMA_PID:-}" ] && kill "${PLASMA_PID}" 2>/dev/null || true
+  [ -n "${PLASMA_PID:-}" ] && terminate_pid "${PLASMA_PID}"
   pkill -TERM -u "${DESKTOP_UID}" -x plasmashell 2>/dev/null || true
   pkill -TERM -u "${DESKTOP_UID}" -x kwin_x11 2>/dev/null || true
   pkill -TERM -u "${DESKTOP_UID}" -x kded6 2>/dev/null || true
-  [ -n "${PLASMA_PID:-}" ] && wait "${PLASMA_PID}" 2>/dev/null || true
+  PLASMA_PID=""
 
   stop_xorg_process
   stop_xwayland_process
@@ -735,6 +881,10 @@ ensure_audio_sink() {
 start_input_bridge() {
   local mode=evdev
 
+  if [ -n "${INPUT_BRIDGE_PID:-}" ] && kill -0 "${INPUT_BRIDGE_PID}" 2>/dev/null; then
+    return 0
+  fi
+
   if [ "${ACTIVE_DISPLAY_DRIVER}" = "xwayland" ]; then
     mode=xtest
     DISPLAY="${DISPLAY_NAME}" \
@@ -763,15 +913,9 @@ start_input_bridge() {
   return 1
 }
 
-start_display() {
+start_capture_display() {
   seed_input_devices
   resolve_display_driver
-  if [ "${ACTIVE_DISPLAY_DRIVER}" != "xwayland" ]; then
-    start_input_bridge || return 1
-  fi
-  start_system_bus || return 1
-  start_session_bus || return 1
-  start_pipewire || return 1
 
   if [ "${ACTIVE_DISPLAY_DRIVER}" = "xwayland" ]; then
     write_desktop_env
@@ -781,7 +925,6 @@ start_display() {
       write_xorg_config dummy
       launch_xorg_process || return 1
     fi
-    start_input_bridge || return 1
   elif [ "${ACTIVE_DISPLAY_DRIVER}" = "modesetting" ] && [ -e "${CARD_NODE}" ]; then
     write_xorg_config "${ACTIVE_DISPLAY_DRIVER}"
     if ! launch_xorg_process; then
@@ -797,8 +940,26 @@ start_display() {
     write_xorg_config dummy
     launch_xorg_process || return 1
   fi
+}
+
+start_desktop_services() {
+  if [ "${ACTIVE_DISPLAY_DRIVER}" != "xwayland" ]; then
+    start_input_bridge || return 1
+  fi
+  start_system_bus || return 1
+  start_session_bus || return 1
+  start_pipewire || return 1
+
+  if [ "${ACTIVE_DISPLAY_DRIVER}" = "xwayland" ]; then
+    start_input_bridge || return 1
+  fi
 
   launch_plasma_process
+}
+
+start_display() {
+  start_capture_display || return 1
+  start_desktop_services
 }
 
 start_sunshine() {
@@ -810,15 +971,264 @@ start_sunshine() {
   SUNSHINE_PID=$!
 }
 
-shutdown() {
-  [ -n "${SUNSHINE_PID:-}" ] && kill "${SUNSHINE_PID}" 2>/dev/null || true
+prepare_session_runtime() {
+  mkdir -p "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}" "${PERSISTENT_HOME_DIR}" "${RUNTIME_DIR}" "${SESSION_RUNTIME_DIR}"
+  bind_home_dir
+  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}"
+  chown "${DESKTOP_UID}:${DESKTOP_GID}" "${HOME_DIR}" 2>/dev/null || true
+  chown "${DESKTOP_UID}:${DESKTOP_GID}" "${RUNTIME_DIR}"
+  chmod 700 "${RUNTIME_DIR}"
+  chmod 1777 /var/lib/xkb /tmp
+  chmod 666 /dev/uinput /dev/uhid 2>/dev/null || true
+  chmod 666 /dev/dri/card* /dev/dri/renderD* 2>/dev/null || true
+}
+
+session_has_live_process() {
+  local pid
+
+  for pid in \
+    "${XORG_PID:-}" \
+    "${XWAYLAND_PID:-}" \
+    "${WESTON_PID:-}" \
+    "${PLASMA_PID:-}" \
+    "${INPUT_BRIDGE_PID:-}" \
+    "${PIPEWIRE_PID:-}" \
+    "${PIPEWIRE_PULSE_PID:-}" \
+    "${WIREPLUMBER_PID:-}" \
+    "${SESSION_DBUS_PID:-}" \
+    "${SYSTEM_DBUS_PID:-}"; do
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+capture_display_live() {
+  local pid
+
+  for pid in "${XORG_PID:-}" "${XWAYLAND_PID:-}" "${WESTON_PID:-}"; do
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+      DISPLAY="${DISPLAY_NAME}" xdpyinfo >/dev/null 2>&1 && return 0
+    fi
+  done
+
+  return 1
+}
+
+desktop_session_live() {
+  local pid
+
+  for pid in \
+    "${PLASMA_PID:-}" \
+    "${INPUT_BRIDGE_PID:-}" \
+    "${PIPEWIRE_PID:-}" \
+    "${PIPEWIRE_PULSE_PID:-}" \
+    "${WIREPLUMBER_PID:-}" \
+    "${SESSION_DBUS_PID:-}" \
+    "${SYSTEM_DBUS_PID:-}"; do
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+x_display_size_matches() {
+  local actual
+
+  actual="$(
+    DISPLAY="${DISPLAY_NAME}" xdpyinfo 2>/dev/null \
+      | awk '/dimensions:/ { print $2; exit }'
+  )"
+  [ "${actual}" = "${WIDTH}x${HEIGHT}" ]
+}
+
+stop_desktop_user_processes() {
+  local comm pid
+
+  for pid in $(pgrep -u "${DESKTOP_UID}" 2>/dev/null || true); do
+    case "${pid}" in
+      "${XWAYLAND_PID:-}"|"${WESTON_PID:-}"|"${XORG_PID:-}") continue ;;
+    esac
+    comm="$(cat "/proc/${pid}/comm" 2>/dev/null || true)"
+    case "${comm}" in
+      sunshine|Xwayland|weston|Xorg) continue ;;
+    esac
+    kill -TERM "${pid}" 2>/dev/null || true
+  done
+
+  sleep 0.5
+
+  for pid in $(pgrep -u "${DESKTOP_UID}" 2>/dev/null || true); do
+    case "${pid}" in
+      "${XWAYLAND_PID:-}"|"${WESTON_PID:-}"|"${XORG_PID:-}") continue ;;
+    esac
+    comm="$(cat "/proc/${pid}/comm" 2>/dev/null || true)"
+    case "${comm}" in
+      sunshine|Xwayland|weston|Xorg) continue ;;
+    esac
+    kill -KILL "${pid}" 2>/dev/null || true
+  done
+}
+
+stop_desktop_services() {
+  [ -n "${PLASMA_PID:-}" ] && terminate_pid "${PLASMA_PID}"
+  pkill -TERM -u "${DESKTOP_UID}" -x plasmashell 2>/dev/null || true
+  pkill -TERM -u "${DESKTOP_UID}" -x kwin_x11 2>/dev/null || true
+  pkill -TERM -u "${DESKTOP_UID}" -x kded6 2>/dev/null || true
+  PLASMA_PID=""
+
+  [ -n "${INPUT_BRIDGE_PID:-}" ] && terminate_pid "${INPUT_BRIDGE_PID}"
+  INPUT_BRIDGE_PID=""
+
+  stop_desktop_user_processes
+
+  [ -n "${WIREPLUMBER_PID:-}" ] && terminate_pid "${WIREPLUMBER_PID}"
+  [ -n "${PIPEWIRE_PULSE_PID:-}" ] && terminate_pid "${PIPEWIRE_PULSE_PID}"
+  [ -n "${PIPEWIRE_PID:-}" ] && terminate_pid "${PIPEWIRE_PID}"
+  [ -n "${SESSION_DBUS_PID:-}" ] && terminate_pid "${SESSION_DBUS_PID}"
+  [ -n "${SYSTEM_DBUS_PID:-}" ] && terminate_pid "${SYSTEM_DBUS_PID}"
+
+  WIREPLUMBER_PID=""
+  PIPEWIRE_PULSE_PID=""
+  PIPEWIRE_PID=""
+  SESSION_DBUS_PID=""
+  SYSTEM_DBUS_PID=""
+  DESKTOP_ACTIVE=0
+
+  rm -f "${RUNTIME_DIR}/pipewire-0" "${RUNTIME_DIR}/pulse/native" "${RUNTIME_DIR}/bus"
+}
+
+stop_desktop_runtime() {
+  stop_desktop_services
   stop_display_processes
-  [ -n "${INPUT_BRIDGE_PID:-}" ] && kill "${INPUT_BRIDGE_PID}" 2>/dev/null || true
-  [ -n "${WIREPLUMBER_PID:-}" ] && kill "${WIREPLUMBER_PID}" 2>/dev/null || true
-  [ -n "${PIPEWIRE_PULSE_PID:-}" ] && kill "${PIPEWIRE_PULSE_PID}" 2>/dev/null || true
-  [ -n "${PIPEWIRE_PID:-}" ] && kill "${PIPEWIRE_PID}" 2>/dev/null || true
-  [ -n "${SESSION_DBUS_PID:-}" ] && kill "${SESSION_DBUS_PID}" 2>/dev/null || true
-  [ -n "${SYSTEM_DBUS_PID:-}" ] && kill "${SYSTEM_DBUS_PID}" 2>/dev/null || true
+  rm -f "${RUNTIME_DIR}/${WAYLAND_SOCKET}" "${RUNTIME_DIR}/${WAYLAND_SOCKET}.lock"
+  rm -f "${SESSION_STATE_FILE}"
+}
+
+session_start_locked() {
+  local requested_height requested_refresh requested_width
+
+  requested_width="$(sanitize_positive_int "${1:-${DEFAULT_WIDTH}}" "${DEFAULT_WIDTH}" 8192)"
+  requested_height="$(sanitize_positive_int "${2:-${DEFAULT_HEIGHT}}" "${DEFAULT_HEIGHT}" 8192)"
+  requested_refresh="$(sanitize_refresh_rate "${3:-${DEFAULT_REFRESH_RATE}}" "${DEFAULT_REFRESH_RATE}")"
+
+  load_session_state >/dev/null 2>&1 || reset_session_vars
+
+  if [ "${DESKTOP_ACTIVE:-0}" = "1" ] && desktop_session_live; then
+    log "Desktop session already running at ${WIDTH}x${HEIGHT}@${REFRESH_RATE}."
+    return 0
+  fi
+
+  set_session_geometry "${requested_width}" "${requested_height}" "${requested_refresh}"
+  prepare_session_runtime
+
+  if capture_display_live; then
+    configure_xrandr_monitor
+  fi
+
+  if ! capture_display_live || ! x_display_size_matches; then
+    log "Restarting capture display for ${WIDTH}x${HEIGHT}@${REFRESH_RATE}."
+    stop_display_processes
+    if ! start_capture_display; then
+      log "Capture display failed to start at ${WIDTH}x${HEIGHT}@${REFRESH_RATE}."
+      stop_desktop_runtime
+      return 1
+    fi
+  fi
+
+  if ! start_desktop_services; then
+    log "Desktop session failed to start at ${WIDTH}x${HEIGHT}@${REFRESH_RATE}."
+    stop_desktop_services
+    write_session_state
+    return 1
+  fi
+
+  DESKTOP_ACTIVE=1
+  write_session_state
+  log "Desktop session started at ${WIDTH}x${HEIGHT}@${REFRESH_RATE} using ${ACTIVE_DISPLAY_DRIVER}."
+}
+
+session_start() {
+  local status
+
+  acquire_session_lock
+  trap release_session_lock EXIT INT TERM
+
+  if session_start_locked "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  release_session_lock
+  trap - EXIT INT TERM
+  return "${status}"
+}
+
+session_stop_locked() {
+  if load_session_state; then
+    log "Stopping desktop session."
+    stop_desktop_services
+    write_session_state
+  else
+    reset_session_vars
+    rm -f "${SESSION_STATE_FILE}"
+    log "Desktop session is already stopped."
+  fi
+}
+
+session_stop() {
+  local status
+
+  acquire_session_lock
+  trap release_session_lock EXIT INT TERM
+
+  if session_stop_locked; then
+    status=0
+  else
+    status=$?
+  fi
+
+  release_session_lock
+  trap - EXIT INT TERM
+  return "${status}"
+}
+
+client_session_start() {
+  local requested_height requested_refresh requested_width
+
+  requested_width="${SUNSHINE_CLIENT_WIDTH:-${DEFAULT_WIDTH}}"
+  requested_height="${SUNSHINE_CLIENT_HEIGHT:-${DEFAULT_HEIGHT}}"
+  requested_refresh="${SUNSHINE_CLIENT_FPS:-${DEFAULT_REFRESH_RATE}}"
+
+  if [ "$(id -u)" -eq 0 ]; then
+    exec /usr/local/bin/arch-sunshine session-start "${requested_width}" "${requested_height}" "${requested_refresh}"
+  fi
+
+  exec /usr/bin/sudo -n /usr/local/bin/arch-sunshine session-start "${requested_width}" "${requested_height}" "${requested_refresh}"
+}
+
+client_session_stop() {
+  mkdir -p "${LOG_DIR}" 2>/dev/null || true
+
+  if [ "$(id -u)" -eq 0 ]; then
+    setsid -f /usr/local/bin/arch-sunshine session-stop \
+      >>"${LOG_DIR}/client-stop.log" 2>&1 </dev/null
+    return 0
+  fi
+
+  setsid -f /usr/bin/sudo -n /usr/local/bin/arch-sunshine session-stop \
+    >>"${LOG_DIR}/client-stop.log" 2>&1 </dev/null
+}
+
+shutdown() {
+  [ -n "${SUNSHINE_PID:-}" ] && terminate_pid "${SUNSHINE_PID}"
+  load_session_state >/dev/null 2>&1 || reset_session_vars
+  stop_desktop_runtime
   if mountpoint -q "${HOME_DIR}"; then
     umount "${HOME_DIR}" 2>/dev/null || true
   fi
@@ -870,17 +1280,39 @@ display_log_file() {
   esac
 }
 
+session_display_status() {
+  if load_session_state; then
+    if [ "${DESKTOP_ACTIVE:-0}" = "1" ] && desktop_session_live; then
+      printf 'running'
+      return
+    fi
+    if capture_display_live; then
+      printf 'sleeping'
+      return
+    fi
+  fi
+
+  reset_session_vars
+  set_session_geometry "${DEFAULT_WIDTH}" "${DEFAULT_HEIGHT}" "${DEFAULT_REFRESH_RATE}"
+  ACTIVE_DISPLAY_DRIVER="${DISPLAY_DRIVER}"
+  printf 'stopped'
+}
+
 wait_for_key() {
   printf '\nPress any key to return.'
   IFS= read -rsn1 _ || true
 }
 
 draw_ui() {
+  local display_state
+
+  display_state="$(session_display_status)"
+
   printf '\033[2J\033[H'
   printf 'Arch Sunshine\n'
   printf '==============\n\n'
   printf 'Status\n'
-  printf '  Display   %s  KDE Plasma X11 %s on %s %sx%s\n' "$(process_status "${PLASMA_PID:-}")" "${ACTIVE_DISPLAY_DRIVER}" "${DISPLAY_NAME}" "${WIDTH}" "${HEIGHT}"
+  printf '  Desktop   %s  KDE Plasma X11 %s on %s %sx%s@%s\n' "${display_state}" "${ACTIVE_DISPLAY_DRIVER}" "${DISPLAY_NAME}" "${WIDTH}" "${HEIGHT}" "${REFRESH_RATE}"
   printf '  Sunshine  %s  https://<host-ip>:47990\n' "$(process_status "${SUNSHINE_PID:-}")"
   printf '  Capture   x11 on %s\n' "${DISPLAY_NAME}"
   printf '  User      %s / %s\n' "${DESKTOP_USER}" "${DESKTOP_USER}"
@@ -977,10 +1409,6 @@ run_ui_loop() {
   local key
 
   while true; do
-    if ! kill -0 "${PLASMA_PID}" 2>/dev/null; then
-      printf '\nDisplay process exited.\n'
-      return
-    fi
     if ! kill -0 "${SUNSHINE_PID}" 2>/dev/null; then
       printf '\nSunshine process exited.\n'
       return
@@ -1002,10 +1430,6 @@ run_ui_loop() {
 
 run_daemon_loop() {
   while true; do
-    if ! kill -0 "${PLASMA_PID}" 2>/dev/null; then
-      log "Display process exited"
-      break
-    fi
     if ! kill -0 "${SUNSHINE_PID}" 2>/dev/null; then
       log "Sunshine process exited"
       break
@@ -1015,22 +1439,26 @@ run_daemon_loop() {
 }
 
 main() {
+  reset_session_vars
+  trap shutdown INT TERM EXIT
   setup_user_data
   seed_web_credentials
-  start_display || {
-    log "KDE Plasma display failed to start"
+  set_session_geometry "${DEFAULT_WIDTH}" "${DEFAULT_HEIGHT}" "${DEFAULT_REFRESH_RATE}"
+  prepare_session_runtime
+  start_capture_display || {
+    log "X11 capture display failed to start"
     log "Xorg logs: ${LOG_DIR}/xorg.log"
     log "Weston logs: ${LOG_DIR}/weston.log"
     log "Xwayland logs: ${LOG_DIR}/xwayland.log"
-    log "Plasma logs: ${LOG_DIR}/plasma.log"
     exit 1
   }
+  DESKTOP_ACTIVE=0
+  write_session_state
   start_sunshine
 
-  trap shutdown INT TERM EXIT
-
   log "Arch Sunshine"
-  log "Display: KDE Plasma X11 ${ACTIVE_DISPLAY_DRIVER} on ${DISPLAY_NAME} (${WIDTH}x${HEIGHT})"
+  log "Desktop: sleeping until Moonlight starts an app"
+  log "Display: X11 capture display ${ACTIVE_DISPLAY_DRIVER} on ${DISPLAY_NAME} (${WIDTH}x${HEIGHT}@${REFRESH_RATE})"
   log "Encoder: Sunshine auto-select"
   log "Sunshine web UI: https://<host-ip>:47990"
   log "Sunshine logs: ${LOG_DIR}/sunshine.log"
@@ -1047,11 +1475,28 @@ main() {
   fi
 
   shutdown
-  wait "${SUNSHINE_PID}" 2>/dev/null || true
-  wait "${PLASMA_PID}" 2>/dev/null || true
-  wait "${XORG_PID}" 2>/dev/null || true
-  wait "${XWAYLAND_PID}" 2>/dev/null || true
-  wait "${WESTON_PID}" 2>/dev/null || true
+  [ -n "${SUNSHINE_PID:-}" ] && wait "${SUNSHINE_PID}" 2>/dev/null || true
+  [ -n "${PLASMA_PID:-}" ] && wait "${PLASMA_PID}" 2>/dev/null || true
+  [ -n "${XORG_PID:-}" ] && wait "${XORG_PID}" 2>/dev/null || true
+  [ -n "${XWAYLAND_PID:-}" ] && wait "${XWAYLAND_PID}" 2>/dev/null || true
+  [ -n "${WESTON_PID:-}" ] && wait "${WESTON_PID}" 2>/dev/null || true
 }
 
-main "$@"
+case "${1:-}" in
+  client-start)
+    client_session_start
+    ;;
+  client-stop)
+    client_session_stop
+    ;;
+  session-start)
+    shift
+    session_start "$@"
+    ;;
+  session-stop)
+    session_stop
+    ;;
+  *)
+    main "$@"
+    ;;
+esac

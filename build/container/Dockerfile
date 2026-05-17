@@ -88,7 +88,10 @@ RUN printf '\nDisableSandbox\n\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n
     && groupadd -f render \
     && useradd -m -u 1000 -s /bin/bash -G wheel,video,input,render sunshine \
     && printf 'sunshine:sunshine\n' | chpasswd \
-    && printf 'sunshine ALL=(ALL) ALL\n' > /etc/sudoers.d/sunshine \
+    && printf '%s\n' \
+      'sunshine ALL=(ALL) ALL' \
+      'sunshine ALL=(root) NOPASSWD: /usr/local/bin/arch-sunshine session-start, /usr/local/bin/arch-sunshine session-start *, /usr/local/bin/arch-sunshine session-stop' \
+      > /etc/sudoers.d/sunshine \
     && chmod 0440 /etc/sudoers.d/sunshine \
     && pacman -Scc --noconfirm
 
