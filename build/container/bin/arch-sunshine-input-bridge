@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+import errno
+import ctypes
+import fcntl
+import os
+import select
+import signal
+import struct
+import time
+
+
+UINPUT = "/dev/uinput"
+DEVICE_NAME = "Arch Sunshine Input Bridge"
+EVENT_SIZE = struct.calcsize("@llHHi")
+
+EV_SYN = 0
+EV_KEY = 1
+EV_REL = 2
+EV_ABS = 3
+
+BUS_USB = 0x03
+KEY_MAX = 0x2FF
+REL_X = 0
+REL_Y = 1
+REL_HWHEEL = 6
+REL_WHEEL = 8
+ABS_X = 0
+ABS_Y = 1
+REL_CODES = (REL_X, REL_Y, REL_HWHEEL, REL_WHEEL)
+ABS_CODES = (ABS_X, ABS_Y)
+BTN_LEFT = 0x110
+BTN_RIGHT = 0x111
+BTN_MIDDLE = 0x112
+BTN_SIDE = 0x113
+BTN_EXTRA = 0x114
+BTN_FORWARD = 0x115
+BTN_BACK = 0x116
+BTN_TASK = 0x117
+BUTTON_CODES = {
+    BTN_LEFT: 1,
+    BTN_MIDDLE: 2,
+    BTN_RIGHT: 3,
+    BTN_SIDE: 8,
+    BTN_EXTRA: 9,
+    BTN_FORWARD: 9,
+    BTN_BACK: 8,
+    BTN_TASK: 10,
+}
+
+running = True
+
+
+def ioc(direction, type_, number, size):
+    return (
+        (direction << 30)
+        | (ord(type_) << 8)
+        | number
+        | (size << 16)
+    )
+
+
+def iow(type_, number, size):
+    return ioc(1, type_, number, size)
+
+
+UI_DEV_CREATE = ioc(0, "U", 1, 0)
+UI_DEV_DESTROY = ioc(0, "U", 2, 0)
+UI_SET_EVBIT = iow("U", 100, struct.calcsize("i"))
+UI_SET_KEYBIT = iow("U", 101, struct.calcsize("i"))
+UI_SET_RELBIT = iow("U", 102, struct.calcsize("i"))
+UI_SET_ABSBIT = iow("U", 103, struct.calcsize("i"))
+
+
+def stop(_signum, _frame):
+    global running
+    running = False
+
+
+def ioctl_int(fd, request, value):
+    fcntl.ioctl(fd, request, value)
+
+
+def create_uinput_device():
+    fd = os.open(UINPUT, os.O_WRONLY | os.O_NONBLOCK)
+
+    for ev_type in (EV_KEY, EV_REL, EV_ABS):
+        ioctl_int(fd, UI_SET_EVBIT, ev_type)
+
+    for code in range(KEY_MAX + 1):
+        ioctl_int(fd, UI_SET_KEYBIT, code)
+    for code in REL_CODES:
+        ioctl_int(fd, UI_SET_RELBIT, code)
+    for code in ABS_CODES:
+        ioctl_int(fd, UI_SET_ABSBIT, code)
+
+    absmax = [0] * 64
+    absmin = [0] * 64
+    absfuzz = [0] * 64
+    absflat = [0] * 64
+    absmax[0] = 65535
+    absmax[1] = 65535
+
+    payload = struct.pack(
+        "@80sHHHHI",
+        DEVICE_NAME.encode("utf-8"),
+        BUS_USB,
+        0xBEEF,
+        0xB00F,
+        1,
+        0,
+    )
+    payload += struct.pack("@64i", *absmax)
+    payload += struct.pack("@64i", *absmin)
+    payload += struct.pack("@64i", *absfuzz)
+    payload += struct.pack("@64i", *absflat)
+
+    os.write(fd, payload)
+    fcntl.ioctl(fd, UI_DEV_CREATE)
+    return fd
+
+
+def passthrough_event_paths():
+    try:
+        data = open("/proc/bus/input/devices", encoding="utf-8").read()
+    except OSError:
+        return []
+
+    paths = []
+    for block in data.strip().split("\n\n"):
+        if "passthrough" not in block or DEVICE_NAME in block:
+            continue
+        for line in block.splitlines():
+            if not line.startswith("H: Handlers="):
+                continue
+            for token in line.split():
+                if token.startswith("event"):
+                    paths.append(f"/dev/input/{token}")
+    return sorted(set(paths))
+
+
+def open_sources(existing):
+    for path in passthrough_event_paths():
+        if path in existing:
+            continue
+        try:
+            existing[path] = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            print(f"forwarding {path}", flush=True)
+        except OSError:
+            pass
+
+
+class XTestInjector:
+    def __init__(self, display_name):
+        self.x11 = ctypes.CDLL("libX11.so.6")
+        self.xtst = ctypes.CDLL("libXtst.so.6")
+
+        self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self.x11.XOpenDisplay.restype = ctypes.c_void_p
+        self.x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+        self.x11.XDefaultScreen.restype = ctypes.c_int
+        self.x11.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.x11.XDisplayWidth.restype = ctypes.c_int
+        self.x11.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.x11.XDisplayHeight.restype = ctypes.c_int
+        self.x11.XFlush.argtypes = [ctypes.c_void_p]
+        self.x11.XFlush.restype = ctypes.c_int
+
+        self.xtst.XTestFakeMotionEvent.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_ulong,
+        ]
+        self.xtst.XTestFakeMotionEvent.restype = ctypes.c_int
+        self.xtst.XTestFakeRelativeMotionEvent.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_ulong,
+        ]
+        self.xtst.XTestFakeRelativeMotionEvent.restype = ctypes.c_int
+        self.xtst.XTestFakeButtonEvent.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.c_ulong,
+        ]
+        self.xtst.XTestFakeButtonEvent.restype = ctypes.c_int
+        self.xtst.XTestFakeKeyEvent.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_int,
+            ctypes.c_ulong,
+        ]
+        self.xtst.XTestFakeKeyEvent.restype = ctypes.c_int
+
+        self.display = self.x11.XOpenDisplay(display_name.encode("utf-8"))
+        if not self.display:
+            raise RuntimeError(f"could not open X display {display_name}")
+        self.screen = self.x11.XDefaultScreen(self.display)
+        self.width = 1
+        self.height = 1
+        self.abs_x = None
+        self.abs_y = None
+        self.rel_x = 0
+        self.rel_y = 0
+        self.refresh_size()
+
+    def refresh_size(self):
+        self.width = max(1, self.x11.XDisplayWidth(self.display, self.screen))
+        self.height = max(1, self.x11.XDisplayHeight(self.display, self.screen))
+
+    def fake_button(self, button, pressed):
+        self.xtst.XTestFakeButtonEvent(self.display, button, int(pressed), 0)
+
+    def fake_key(self, evdev_code, pressed):
+        # Xwayland uses the standard evdev + 8 keycode offset for normal keys.
+        keycode = evdev_code + 8
+        if 8 <= keycode <= 255:
+            self.xtst.XTestFakeKeyEvent(self.display, keycode, int(pressed), 0)
+
+    def fake_wheel(self, positive_button, negative_button, value):
+        button = positive_button if value > 0 else negative_button
+        for _ in range(abs(value)):
+            self.fake_button(button, True)
+            self.fake_button(button, False)
+
+    def handle_event(self, event):
+        _sec, _usec, ev_type, code, value = event
+
+        if ev_type == EV_SYN:
+            self.flush()
+            return
+
+        if ev_type == EV_KEY:
+            if code in BUTTON_CODES:
+                self.fake_button(BUTTON_CODES[code], value != 0)
+            else:
+                self.fake_key(code, value != 0)
+            return
+
+        if ev_type == EV_REL:
+            if code == REL_X:
+                self.rel_x += value
+            elif code == REL_Y:
+                self.rel_y += value
+            elif code == REL_WHEEL:
+                self.fake_wheel(4, 5, value)
+            elif code == REL_HWHEEL:
+                self.fake_wheel(7, 6, value)
+            return
+
+        if ev_type == EV_ABS:
+            if code == ABS_X:
+                self.abs_x = max(0, min(65535, value))
+            elif code == ABS_Y:
+                self.abs_y = max(0, min(65535, value))
+
+    def flush(self):
+        if self.abs_x is not None and self.abs_y is not None:
+            self.refresh_size()
+            x = round(self.abs_x * (self.width - 1) / 65535)
+            y = round(self.abs_y * (self.height - 1) / 65535)
+            self.xtst.XTestFakeMotionEvent(self.display, self.screen, x, y, 0)
+
+        if self.rel_x or self.rel_y:
+            self.xtst.XTestFakeRelativeMotionEvent(
+                self.display,
+                self.rel_x,
+                self.rel_y,
+                0,
+            )
+            self.rel_x = 0
+            self.rel_y = 0
+
+        self.x11.XFlush(self.display)
+
+
+def event_is_supported(event):
+    _sec, _usec, ev_type, code, _value = event
+    if ev_type == EV_SYN:
+        return True
+    if ev_type == EV_KEY:
+        return 0 <= code <= KEY_MAX
+    if ev_type == EV_REL:
+        return code in REL_CODES
+    if ev_type == EV_ABS:
+        return code in ABS_CODES
+    return False
+
+
+def forward_events(sources, handler):
+    if not sources:
+        time.sleep(0.1)
+        return
+
+    ready, _, _ = select.select(list(sources.values()), [], [], 0.25)
+    fd_to_path = {fd: path for path, fd in sources.items()}
+
+    for source_fd in ready:
+        path = fd_to_path[source_fd]
+        try:
+            data = os.read(source_fd, EVENT_SIZE * 64)
+        except OSError as exc:
+            if exc.errno in (errno.ENODEV, errno.ENXIO, errno.EBADF):
+                os.close(source_fd)
+                sources.pop(path, None)
+            continue
+
+        for offset in range(0, len(data) - (len(data) % EVENT_SIZE), EVENT_SIZE):
+            chunk = data[offset : offset + EVENT_SIZE]
+            event = struct.unpack("@llHHi", chunk)
+            if event_is_supported(event):
+                handler(chunk, event)
+
+
+def wait_for_xtest_display(display_name):
+    while running:
+        try:
+            return XTestInjector(display_name)
+        except RuntimeError as exc:
+            print(str(exc), flush=True)
+            time.sleep(0.5)
+    raise RuntimeError("stopped before XTEST display was available")
+
+
+def run_xtest_bridge():
+    display_name = os.environ.get("DISPLAY", ":99")
+    injector = wait_for_xtest_display(display_name)
+    sources = {}
+    last_scan = 0.0
+    print(f"injecting XTEST events into {display_name}", flush=True)
+
+    while running:
+        now = time.monotonic()
+        if now - last_scan >= 0.5:
+            open_sources(sources)
+            last_scan = now
+        forward_events(sources, lambda _chunk, event: injector.handle_event(event))
+
+
+def run_uinput_bridge():
+    uinput_fd = create_uinput_device()
+    sources = {}
+    last_scan = 0.0
+
+    try:
+        while running:
+            now = time.monotonic()
+            if now - last_scan >= 0.5:
+                open_sources(sources)
+                last_scan = now
+            forward_events(sources, lambda chunk, _event: os.write(uinput_fd, chunk))
+    finally:
+        for fd in sources.values():
+            os.close(fd)
+        fcntl.ioctl(uinput_fd, UI_DEV_DESTROY)
+        os.close(uinput_fd)
+
+
+def main():
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    if os.environ.get("ARCH_SUNSHINE_INPUT_MODE") == "xtest":
+        run_xtest_bridge()
+    else:
+        run_uinput_bridge()
+
+
+if __name__ == "__main__":
+    main()

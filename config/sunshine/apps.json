@@ -1,0 +1,24 @@
+{
+  "env": {
+    "PATH": "$(PATH):$(HOME)/.local/bin",
+    "LANG": "en_US.UTF-8",
+    "LC_CTYPE": "en_US.UTF-8",
+    "XDG_CURRENT_DESKTOP": "KDE",
+    "XDG_MENU_PREFIX": "plasma-",
+    "XDG_SESSION_TYPE": "x11",
+    "DESKTOP_SESSION": "plasma",
+    "KDE_SESSION_VERSION": "6",
+    "KDE_FULL_SESSION": "true",
+    "QT_QPA_PLATFORM": "xcb",
+    "LIBGL_DRI3_ENABLE": "1",
+    "MOZ_ENABLE_WAYLAND": "0",
+    "SDL_VIDEODRIVER": "x11",
+    "STEAM_RUNTIME": "1"
+  },
+  "apps": [
+    {
+      "name": "Desktop",
+      "image-path": "desktop.png"
+    }
+  ]
+}

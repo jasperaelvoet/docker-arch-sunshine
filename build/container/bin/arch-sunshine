@@ -1,0 +1,979 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+USER_DATA=/mnt/user_data
+CONFIG_DIR="${USER_DATA}/etc/sunshine"
+STATE_DIR="${USER_DATA}/var/lib/sunshine"
+LOG_DIR="${USER_DATA}/var/log/arch-sunshine"
+DESKTOP_USER=sunshine
+DESKTOP_UID=1000
+DESKTOP_GID=1000
+PERSISTENT_HOME_DIR="${USER_DATA}/home/${DESKTOP_USER}"
+HOME_DIR="/home/${DESKTOP_USER}"
+RUNTIME_DIR="/run/user/${DESKTOP_UID}"
+DISPLAY_NUM="${SUNSHINE_DISPLAY_NUM:-99}"
+DISPLAY_NAME=":${DISPLAY_NUM}"
+WAYLAND_SOCKET="${SUNSHINE_WAYLAND_SOCKET:-arch-sunshine-wayland}"
+DISPLAY_DRIVER="${SUNSHINE_DISPLAY_DRIVER:-auto}"
+ACTIVE_DISPLAY_DRIVER="${DISPLAY_DRIVER}"
+CARD_NODE="${SUNSHINE_CARD_NODE:-/dev/dri/card0}"
+OUTPUT_NAME="${SUNSHINE_OUTPUT_NAME:-}"
+RENDER_NODE="${SUNSHINE_RENDER_NODE:-/dev/dri/renderD128}"
+WIDTH="${SUNSHINE_WIDTH:-1920}"
+HEIGHT="${SUNSHINE_HEIGHT:-1080}"
+XORG_CONFIG="${LOG_DIR}/xorg.conf"
+WEB_UI_USER=sunshine
+WEB_UI_PASS=sunshine
+
+log() {
+  printf '%s\n' "$*"
+}
+
+run_as_desktop_user() {
+  local env_args=(
+    "HOME=${HOME_DIR}"
+    "USER=${DESKTOP_USER}"
+    "LOGNAME=${DESKTOP_USER}"
+    "LANG=en_US.UTF-8"
+    "LC_CTYPE=en_US.UTF-8"
+    "XDG_RUNTIME_DIR=${RUNTIME_DIR}"
+    "XDG_CONFIG_HOME=${HOME_DIR}/.config"
+    "XDG_DATA_HOME=${HOME_DIR}/.local/share"
+    "XDG_CURRENT_DESKTOP=KDE"
+    "XDG_MENU_PREFIX=plasma-"
+    "XDG_SESSION_DESKTOP=KDE"
+    "XDG_SESSION_TYPE=x11"
+    "XDG_DATA_DIRS=/usr/local/share:/usr/share"
+    "XDG_CONFIG_DIRS=/etc/xdg"
+    "DESKTOP_SESSION=plasma"
+    "KDE_SESSION_VERSION=6"
+    "KDE_FULL_SESSION=true"
+    "QT_QPA_PLATFORM=xcb"
+    "LIBGL_DRI3_ENABLE=1"
+    "SDL_VIDEODRIVER=x11"
+    "STEAM_RUNTIME=1"
+    "DISPLAY=${DISPLAY_NAME}"
+  )
+
+  if [ -n "${SUNSHINE_VAAPI_DRIVER:-}" ]; then
+    env_args+=("LIBVA_DRIVER_NAME=${SUNSHINE_VAAPI_DRIVER}")
+  fi
+
+  runuser -u "${DESKTOP_USER}" -- env "${env_args[@]}" "${@}"
+}
+
+run_desktop_base() {
+  runuser -u "${DESKTOP_USER}" -- env \
+    "HOME=${HOME_DIR}" \
+    "USER=${DESKTOP_USER}" \
+    "LOGNAME=${DESKTOP_USER}" \
+    "LANG=en_US.UTF-8" \
+    "LC_CTYPE=en_US.UTF-8" \
+    "XDG_RUNTIME_DIR=${RUNTIME_DIR}" \
+    "${@}"
+}
+
+set_config_value() {
+  local key="$1"
+  local value="$2"
+  local file="${CONFIG_DIR}/sunshine.conf"
+
+  if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "${file}"; then
+    sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = ${value}|" "${file}"
+  else
+    printf '%s = %s\n' "${key}" "${value}" >> "${file}"
+  fi
+}
+
+bind_home_dir() {
+  mkdir -p /home "${PERSISTENT_HOME_DIR}"
+
+  if mountpoint -q "${HOME_DIR}"; then
+    return 0
+  fi
+
+  if [ -L "${HOME_DIR}" ]; then
+    rm -f "${HOME_DIR}"
+  elif [ -e "${HOME_DIR}" ] && [ ! -d "${HOME_DIR}" ]; then
+    rm -f "${HOME_DIR}"
+  fi
+
+  mkdir -p "${HOME_DIR}"
+  mount --bind "${PERSISTENT_HOME_DIR}" "${HOME_DIR}"
+}
+
+normalize_desktop_paths() {
+  local places="${HOME_DIR}/.local/share/user-places.xbel"
+
+  cat > "${HOME_DIR}/.config/user-dirs.dirs" <<EOF
+XDG_DESKTOP_DIR="\$HOME/Desktop"
+XDG_DOWNLOAD_DIR="\$HOME/Downloads"
+XDG_TEMPLATES_DIR="\$HOME/Templates"
+XDG_PUBLICSHARE_DIR="\$HOME/Public"
+XDG_DOCUMENTS_DIR="\$HOME/Documents"
+XDG_MUSIC_DIR="\$HOME/Music"
+XDG_PICTURES_DIR="\$HOME/Pictures"
+XDG_VIDEOS_DIR="\$HOME/Videos"
+EOF
+
+  if [ -f "${places}" ]; then
+    sed -i \
+      -e "s|file://${USER_DATA}/home/retro|file://${HOME_DIR}|g" \
+      -e "s|file://${PERSISTENT_HOME_DIR}|file://${HOME_DIR}|g" \
+      "${places}"
+  fi
+}
+
+seed_desktop_launchers() {
+  local steam_desktop="${HOME_DIR}/.local/share/applications/steam.desktop"
+
+  if [ -f /usr/share/applications/steam.desktop ]; then
+    mkdir -p "${HOME_DIR}/.local/share/applications"
+    awk '
+      /^Exec=/ && !done {
+        print "Exec=/usr/local/bin/arch-sunshine-steam %U"
+        done = 1
+        next
+      }
+      { print }
+    ' /usr/share/applications/steam.desktop > "${steam_desktop}"
+    chmod 0644 "${steam_desktop}"
+  fi
+}
+
+seed_konsole_profile() {
+  mkdir -p "${HOME_DIR}/.local/share/konsole"
+  cat > "${HOME_DIR}/.local/share/konsole/ArchSunshine.profile" <<EOF
+[General]
+Command=/bin/bash
+Name=Arch Sunshine
+Parent=FALLBACK/
+EOF
+
+  cat > "${HOME_DIR}/.config/konsolerc" <<EOF
+[Desktop Entry]
+DefaultProfile=ArchSunshine.profile
+EOF
+}
+
+drm_output_name_from_status_path() {
+  local drm_name
+
+  drm_name="$(basename "$(dirname "$1")")"
+  drm_name="${drm_name#card[0-9]-}"
+  drm_name="${drm_name/HDMI-A-/HDMI-}"
+  printf '%s\n' "${drm_name}"
+}
+
+detect_connected_output() {
+  local status_path
+
+  for status_path in /sys/class/drm/card*-*/status; do
+    [ -e "${status_path}" ] || continue
+    if [ "$(cat "${status_path}" 2>/dev/null || true)" = "connected" ]; then
+      drm_output_name_from_status_path "${status_path}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+resolve_display_driver() {
+  case "${DISPLAY_DRIVER}" in
+    auto)
+      if [ -e "${CARD_NODE}" ] && OUTPUT_NAME="$(detect_connected_output)"; then
+        ACTIVE_DISPLAY_DRIVER=modesetting
+      elif [ -e "${RENDER_NODE}" ] && command -v weston >/dev/null 2>&1 && command -v Xwayland >/dev/null 2>&1; then
+        ACTIVE_DISPLAY_DRIVER=xwayland
+      else
+        ACTIVE_DISPLAY_DRIVER=dummy
+      fi
+      ;;
+    modesetting)
+      if [ -z "${OUTPUT_NAME}" ]; then
+        OUTPUT_NAME="$(detect_connected_output || true)"
+      fi
+      if [ -z "${OUTPUT_NAME}" ]; then
+        OUTPUT_NAME=DP-1
+      fi
+      ACTIVE_DISPLAY_DRIVER=modesetting
+      ;;
+    xwayland)
+      ACTIVE_DISPLAY_DRIVER=xwayland
+      ;;
+    *)
+      ACTIVE_DISPLAY_DRIVER=dummy
+      ;;
+  esac
+}
+
+setup_user_data() {
+  if [ -d "${USER_DATA}/home/retro" ] && [ ! -e "${PERSISTENT_HOME_DIR}" ]; then
+    mv "${USER_DATA}/home/retro" "${PERSISTENT_HOME_DIR}"
+  fi
+
+  mkdir -p "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}" "${PERSISTENT_HOME_DIR}" "${RUNTIME_DIR}"
+  mkdir -p "${PERSISTENT_HOME_DIR}/.cache" "${PERSISTENT_HOME_DIR}/.config" "${PERSISTENT_HOME_DIR}/.local/share"
+  mkdir -p \
+    "${PERSISTENT_HOME_DIR}/Desktop" \
+    "${PERSISTENT_HOME_DIR}/Documents" \
+    "${PERSISTENT_HOME_DIR}/Downloads" \
+    "${PERSISTENT_HOME_DIR}/Music" \
+    "${PERSISTENT_HOME_DIR}/Pictures" \
+    "${PERSISTENT_HOME_DIR}/Projects" \
+    "${PERSISTENT_HOME_DIR}/Public" \
+    "${PERSISTENT_HOME_DIR}/Templates" \
+    "${PERSISTENT_HOME_DIR}/Videos"
+  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${PERSISTENT_HOME_DIR}"
+  bind_home_dir
+
+  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}" "${HOME_DIR}"
+  chown "${DESKTOP_UID}:${DESKTOP_GID}" "${RUNTIME_DIR}"
+  chmod 700 "${RUNTIME_DIR}"
+  chmod 1777 /var/lib/xkb
+  chmod 1777 /tmp
+  rm -f "${RUNTIME_DIR}"/wayland-* "${RUNTIME_DIR}"/sway-ipc.*.sock
+  rm -f /tmp/.X"${DISPLAY_NUM}"-lock
+  rm -f /tmp/.X11-unix/X"${DISPLAY_NUM}"
+  chmod 666 /dev/uinput /dev/uhid 2>/dev/null || true
+  chmod 666 /dev/dri/card* /dev/dri/renderD* 2>/dev/null || true
+
+  if [ ! -s /etc/machine-id ]; then
+    dbus-uuidgen > /etc/machine-id
+  fi
+  mkdir -p /var/lib/dbus
+  if [ ! -e /var/lib/dbus/machine-id ]; then
+    cp /etc/machine-id /var/lib/dbus/machine-id
+  fi
+
+  if [ ! -f "${CONFIG_DIR}/sunshine.conf" ]; then
+    cp /usr/share/arch-sunshine/sunshine/sunshine.conf "${CONFIG_DIR}/sunshine.conf"
+  fi
+  cp /usr/share/arch-sunshine/sunshine/apps.json "${CONFIG_DIR}/apps.json"
+
+  set_config_value capture x11
+  set_config_value file_apps "${CONFIG_DIR}/apps.json"
+  set_config_value file_state "${STATE_DIR}/sunshine_state.json"
+  set_config_value credentials_file "${STATE_DIR}/sunshine_state.json"
+  set_config_value log_path "${LOG_DIR}/sunshine.log"
+  rm -f "${HOME_DIR}/.cache/ksycoca6"*
+  rm -rf "${HOME_DIR}/.cache/menus"
+  rm -rf "${HOME_DIR}/.local/share/kscreen"
+  rm -rf "${HOME_DIR}/.config/session"
+  normalize_desktop_paths
+  seed_desktop_launchers
+  seed_konsole_profile
+  cat > "${HOME_DIR}/.config/ksplashrc" <<EOF
+[KSplash]
+Engine=none
+EOF
+  cat > "${HOME_DIR}/.config/kded6rc" <<EOF
+[Module-kscreen]
+autoload=false
+EOF
+  cat > "${HOME_DIR}/.config/kded5rc" <<EOF
+[Module-kscreen]
+autoload=false
+EOF
+  cat > "${HOME_DIR}/.config/ksmserverrc" <<EOF
+[General]
+loginMode=emptySession
+EOF
+  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}" "${HOME_DIR}"
+
+  run_as_desktop_user xdg-user-dirs-update >/dev/null 2>&1 || true
+  run_as_desktop_user kbuildsycoca6 --noincremental \
+    >"${LOG_DIR}/kbuildsycoca.log" 2>&1 || true
+}
+
+seed_input_devices() {
+  local event minor
+
+  mkdir -p /dev/input /run/udev/data
+
+  for event in $(seq 0 63); do
+    minor=$((64 + event))
+    mknod -m 666 "/dev/input/event${event}" c 13 "${minor}" 2>/dev/null || true
+    chmod 666 "/dev/input/event${event}" 2>/dev/null || true
+    cat > "/run/udev/data/c13:${minor}" <<EOF
+I:0
+E:ID_INPUT=1
+E:ID_INPUT_KEYBOARD=1
+E:ID_INPUT_MOUSE=1
+E:ID_SEAT=seat0
+E:ID_FOR_SEAT=input-event${event}
+G:seat
+Q:seat
+V:1
+EOF
+  done
+}
+
+seed_web_credentials() {
+  run_as_desktop_user sunshine "${CONFIG_DIR}/sunshine.conf" --creds "${WEB_UI_USER}" "${WEB_UI_PASS}" \
+    >"${LOG_DIR}/credentials.log" 2>&1
+}
+
+write_desktop_env() {
+  mkdir -p "${HOME_DIR}/.config/plasma-workspace/env"
+  cat > "${HOME_DIR}/.config/plasma-workspace/env/arch-sunshine.sh" <<EOF
+export XDG_CURRENT_DESKTOP=KDE
+export XDG_MENU_PREFIX=plasma-
+export XDG_SESSION_DESKTOP=KDE
+export XDG_SESSION_TYPE=x11
+export DESKTOP_SESSION=plasma
+export KDE_SESSION_VERSION=6
+export KDE_FULL_SESSION=true
+export QT_QPA_PLATFORM=xcb
+export MOZ_ENABLE_WAYLAND=0
+export SDL_VIDEODRIVER=x11
+export LIBGL_DRI3_ENABLE=1
+EOF
+  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${HOME_DIR}/.config"
+}
+
+write_xorg_config() {
+  local driver="${1:-${DISPLAY_DRIVER}}"
+  local mode_line
+  local mode_name
+
+  ACTIVE_DISPLAY_DRIVER="${driver}"
+  write_desktop_env
+  mode_name="${WIDTH}x${HEIGHT}_60.00"
+  mode_line="$(cvt "${WIDTH}" "${HEIGHT}" 60 | awk '/Modeline/ {sub(/^Modeline /, ""); print}')"
+  if [ -z "${mode_line}" ]; then
+    mode_line="\"${mode_name}\" 173.00 ${WIDTH} $((WIDTH + 2048)) $((WIDTH + 2248)) $((WIDTH + 2576)) ${HEIGHT} $((HEIGHT + 3)) $((HEIGHT + 8)) $((HEIGHT + 38)) -hsync +vsync"
+  fi
+
+  if [ "${driver}" = "modesetting" ]; then
+    cat > "${XORG_CONFIG}" <<EOF
+Section "ServerFlags"
+    Option "AutoAddDevices" "true"
+    Option "DontVTSwitch" "true"
+    Option "AllowMouseOpenFail" "true"
+    Option "BlankTime" "0"
+    Option "StandbyTime" "0"
+    Option "SuspendTime" "0"
+    Option "OffTime" "0"
+EndSection
+
+Section "InputClass"
+    Identifier "Arch Sunshine Input Bridge"
+    MatchProduct "Arch Sunshine Input Bridge"
+    Driver "libinput"
+EndSection
+
+Section "Device"
+    Identifier "ArchSunshineGPU"
+    Driver "modesetting"
+    Option "kmsdev" "${CARD_NODE}"
+    Option "AccelMethod" "glamor"
+    Option "PageFlip" "true"
+    Option "PrimaryGPU" "true"
+EndSection
+
+Section "Monitor"
+    Identifier "ArchSunshineMonitor"
+    HorizSync 5.0 - 1000.0
+    VertRefresh 5.0 - 200.0
+EndSection
+
+Section "Screen"
+    Identifier "ArchSunshineScreen"
+    Device "ArchSunshineGPU"
+    Monitor "ArchSunshineMonitor"
+    DefaultDepth 24
+    SubSection "Display"
+        Depth 24
+        Virtual ${WIDTH} ${HEIGHT}
+    EndSubSection
+EndSection
+EOF
+  else
+    cat > "${XORG_CONFIG}" <<EOF
+Section "ServerFlags"
+    Option "AutoAddDevices" "true"
+    Option "DontVTSwitch" "true"
+    Option "AllowMouseOpenFail" "true"
+EndSection
+
+Section "InputClass"
+    Identifier "Arch Sunshine Input Bridge"
+    MatchProduct "Arch Sunshine Input Bridge"
+    Driver "libinput"
+EndSection
+
+Section "Device"
+    Identifier "DummyDevice"
+    Driver "dummy"
+    VideoRam 512000
+EndSection
+
+Section "Monitor"
+    Identifier "DummyMonitor"
+    HorizSync 5.0 - 1000.0
+    VertRefresh 5.0 - 200.0
+    Modeline ${mode_line}
+EndSection
+
+Section "Screen"
+    Identifier "DummyScreen"
+    Device "DummyDevice"
+    Monitor "DummyMonitor"
+    DefaultDepth 24
+    SubSection "Display"
+        Depth 24
+        Modes "${mode_name}"
+        Virtual ${WIDTH} ${HEIGHT}
+    EndSubSection
+EndSection
+EOF
+  fi
+}
+
+configure_xrandr_monitor() {
+  local height_mm mode_args mode_line mode_name output width_mm
+
+  mode_name="${WIDTH}x${HEIGHT}_60.00"
+  mode_line="$(cvt "${WIDTH}" "${HEIGHT}" 60 | awk '/Modeline/ {sub(/^Modeline /, ""); print}')"
+  if [ -z "${mode_line}" ]; then
+    mode_line="\"${mode_name}\" 173.00 ${WIDTH} $((WIDTH + 2048)) $((WIDTH + 2248)) $((WIDTH + 2576)) ${HEIGHT} $((HEIGHT + 3)) $((HEIGHT + 8)) $((HEIGHT + 38)) -hsync +vsync"
+  fi
+  mode_args="${mode_line#\"${mode_name}\" }"
+  width_mm=$((WIDTH * 254 / 960))
+  height_mm=$((HEIGHT * 254 / 960))
+  output=none
+
+  DISPLAY="${DISPLAY_NAME}" xrandr --fb "${WIDTH}x${HEIGHT}" \
+    >"${LOG_DIR}/xrandr.log" 2>&1 || true
+
+  if [ "${ACTIVE_DISPLAY_DRIVER}" = "modesetting" ]; then
+    DISPLAY="${DISPLAY_NAME}" xrandr --newmode "${mode_name}" ${mode_args} \
+      >>"${LOG_DIR}/xrandr.log" 2>&1 || true
+    DISPLAY="${DISPLAY_NAME}" xrandr --addmode "${OUTPUT_NAME}" "${mode_name}" \
+      >>"${LOG_DIR}/xrandr.log" 2>&1 || true
+    DISPLAY="${DISPLAY_NAME}" xrandr --output "${OUTPUT_NAME}" --mode "${mode_name}" --primary \
+      >>"${LOG_DIR}/xrandr.log" 2>&1 || true
+    output="${OUTPUT_NAME}"
+  elif [ "${ACTIVE_DISPLAY_DRIVER}" = "xwayland" ]; then
+    output="$(
+      DISPLAY="${DISPLAY_NAME}" xrandr --query 2>/dev/null \
+        | awk '/ connected/ { print $1; exit }'
+    )"
+    if [ -n "${output}" ]; then
+      DISPLAY="${DISPLAY_NAME}" xrandr --output "${output}" --mode "${WIDTH}x${HEIGHT}" --primary \
+        >>"${LOG_DIR}/xrandr.log" 2>&1 || true
+    else
+      output=none
+    fi
+  fi
+
+  DISPLAY="${DISPLAY_NAME}" xrandr --delmonitor ArchSunshine \
+    >>"${LOG_DIR}/xrandr.log" 2>&1 || true
+  DISPLAY="${DISPLAY_NAME}" xrandr --setmonitor ArchSunshine "${WIDTH}/${width_mm}x${HEIGHT}/${height_mm}+0+0" "${output}" \
+    >>"${LOG_DIR}/xrandr.log" 2>&1 || true
+}
+
+launch_xorg_process() {
+  rm -f /tmp/.X"${DISPLAY_NUM}"-lock
+  rm -f /tmp/.X11-unix/X"${DISPLAY_NUM}"
+
+  Xorg "${DISPLAY_NAME}" \
+    -config "${XORG_CONFIG}" \
+    -noreset \
+    -ac \
+    -nolisten tcp \
+    -logfile "${LOG_DIR}/xorg.log" \
+    >"${LOG_DIR}/xorg.stdout.log" 2>&1 &
+  XORG_PID=$!
+
+  for _ in $(seq 1 100); do
+    if DISPLAY="${DISPLAY_NAME}" xdpyinfo >/dev/null 2>&1; then
+      configure_xrandr_monitor
+      return 0
+    fi
+    if ! kill -0 "${XORG_PID}" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  return 1
+}
+
+launch_weston_process() {
+  rm -f "${RUNTIME_DIR}/${WAYLAND_SOCKET}" "${RUNTIME_DIR}/${WAYLAND_SOCKET}.lock"
+
+  run_desktop_base \
+    WLR_RENDER_DRM_DEVICE="${RENDER_NODE}" \
+    weston \
+      --backend=headless-backend.so \
+      --renderer=gl \
+      --width="${WIDTH}" \
+      --height="${HEIGHT}" \
+      --socket="${WAYLAND_SOCKET}" \
+      --idle-time=0 \
+    >"${LOG_DIR}/weston.log" 2>&1 &
+  WESTON_PID=$!
+
+  for _ in $(seq 1 100); do
+    if [ -S "${RUNTIME_DIR}/${WAYLAND_SOCKET}" ]; then
+      return 0
+    fi
+    if ! kill -0 "${WESTON_PID}" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  return 1
+}
+
+launch_xwayland_process() {
+  rm -f /tmp/.X"${DISPLAY_NUM}"-lock
+  rm -f /tmp/.X11-unix/X"${DISPLAY_NUM}"
+
+  run_desktop_base \
+    WAYLAND_DISPLAY="${WAYLAND_SOCKET}" \
+    Xwayland "${DISPLAY_NAME}" \
+      -geometry "${WIDTH}x${HEIGHT}" \
+      -fullscreen \
+      -ac \
+      -noreset \
+      -glamor es \
+      -verbose 2 \
+    >"${LOG_DIR}/xwayland.log" 2>&1 &
+  XWAYLAND_PID=$!
+
+  for _ in $(seq 1 100); do
+    if DISPLAY="${DISPLAY_NAME}" xdpyinfo >/dev/null 2>&1; then
+      configure_xrandr_monitor
+      DISPLAY="${DISPLAY_NAME}" xset s off -dpms >/dev/null 2>&1 || true
+      return 0
+    fi
+    if ! kill -0 "${XWAYLAND_PID}" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  return 1
+}
+
+stop_xorg_process() {
+  if [ -n "${XORG_PID:-}" ]; then
+    kill "${XORG_PID}" 2>/dev/null || true
+    wait "${XORG_PID}" 2>/dev/null || true
+    kill -KILL "${XORG_PID}" 2>/dev/null || true
+  fi
+  XORG_PID=""
+
+  rm -f /tmp/.X"${DISPLAY_NUM}"-lock
+  rm -f /tmp/.X11-unix/X"${DISPLAY_NUM}"
+}
+
+stop_xwayland_process() {
+  if [ -n "${XWAYLAND_PID:-}" ]; then
+    kill "${XWAYLAND_PID}" 2>/dev/null || true
+    wait "${XWAYLAND_PID}" 2>/dev/null || true
+    kill -KILL "${XWAYLAND_PID}" 2>/dev/null || true
+  fi
+  XWAYLAND_PID=""
+
+  if [ -n "${WESTON_PID:-}" ]; then
+    kill "${WESTON_PID}" 2>/dev/null || true
+    wait "${WESTON_PID}" 2>/dev/null || true
+    kill -KILL "${WESTON_PID}" 2>/dev/null || true
+  fi
+  WESTON_PID=""
+
+  rm -f /tmp/.X"${DISPLAY_NUM}"-lock
+  rm -f /tmp/.X11-unix/X"${DISPLAY_NUM}"
+  rm -f "${RUNTIME_DIR}/${WAYLAND_SOCKET}" "${RUNTIME_DIR}/${WAYLAND_SOCKET}.lock"
+}
+
+launch_plasma_process() {
+  run_as_desktop_user dbus-run-session -- startplasma-x11 \
+    >"${LOG_DIR}/plasma.log" 2>&1 &
+  PLASMA_PID=$!
+
+  for _ in $(seq 1 160); do
+    if DISPLAY="${DISPLAY_NAME}" pgrep -u "${DESKTOP_UID}" -x plasmashell >/dev/null 2>&1; then
+      return 0
+    fi
+    if ! kill -0 "${PLASMA_PID}" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  return 1
+}
+
+stop_display_processes() {
+  [ -n "${PLASMA_PID:-}" ] && kill "${PLASMA_PID}" 2>/dev/null || true
+  pkill -TERM -u "${DESKTOP_UID}" -x plasmashell 2>/dev/null || true
+  pkill -TERM -u "${DESKTOP_UID}" -x kwin_x11 2>/dev/null || true
+  pkill -TERM -u "${DESKTOP_UID}" -x kded6 2>/dev/null || true
+  [ -n "${PLASMA_PID:-}" ] && wait "${PLASMA_PID}" 2>/dev/null || true
+
+  stop_xorg_process
+  stop_xwayland_process
+  sleep 0.3
+  pkill -KILL -u "${DESKTOP_UID}" -x plasmashell 2>/dev/null || true
+  pkill -KILL -u "${DESKTOP_UID}" -x kwin_x11 2>/dev/null || true
+
+  rm -f /tmp/.X"${DISPLAY_NUM}"-lock
+  rm -f /tmp/.X11-unix/X"${DISPLAY_NUM}"
+}
+
+start_system_bus() {
+  mkdir -p /run/dbus
+  rm -f /run/dbus/system_bus_socket /run/dbus/pid
+
+  dbus-daemon --system --nofork --nopidfile \
+    >"${LOG_DIR}/dbus-system.log" 2>&1 &
+  SYSTEM_DBUS_PID=$!
+
+  for _ in $(seq 1 50); do
+    if [ -S /run/dbus/system_bus_socket ]; then
+      return 0
+    fi
+    if ! kill -0 "${SYSTEM_DBUS_PID}" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  return 1
+}
+
+start_pipewire() {
+  run_as_desktop_user pipewire >"${LOG_DIR}/pipewire.log" 2>&1 &
+  PIPEWIRE_PID=$!
+
+  run_as_desktop_user wireplumber >"${LOG_DIR}/wireplumber.log" 2>&1 &
+  WIREPLUMBER_PID=$!
+}
+
+start_input_bridge() {
+  local mode=evdev
+
+  if [ "${ACTIVE_DISPLAY_DRIVER}" = "xwayland" ]; then
+    mode=xtest
+    DISPLAY="${DISPLAY_NAME}" \
+      XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+      ARCH_SUNSHINE_INPUT_MODE=xtest \
+      arch-sunshine-input-bridge >"${LOG_DIR}/input-bridge.log" 2>&1 &
+  else
+    arch-sunshine-input-bridge >"${LOG_DIR}/input-bridge.log" 2>&1 &
+  fi
+  INPUT_BRIDGE_PID=$!
+
+  for _ in $(seq 1 50); do
+    seed_input_devices
+    if [ "${mode}" = "xtest" ] && kill -0 "${INPUT_BRIDGE_PID}" 2>/dev/null; then
+      return 0
+    fi
+    if grep -q 'Arch Sunshine Input Bridge' /proc/bus/input/devices 2>/dev/null; then
+      return 0
+    fi
+    if ! kill -0 "${INPUT_BRIDGE_PID}" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  return 1
+}
+
+start_display() {
+  seed_input_devices
+  resolve_display_driver
+  if [ "${ACTIVE_DISPLAY_DRIVER}" != "xwayland" ]; then
+    start_input_bridge || return 1
+  fi
+  start_system_bus || return 1
+  start_pipewire
+
+  if [ "${ACTIVE_DISPLAY_DRIVER}" = "xwayland" ]; then
+    write_desktop_env
+    if ! launch_weston_process || ! launch_xwayland_process; then
+      stop_xwayland_process
+      log "GPU Xwayland display failed; falling back to dummy Xorg."
+      write_xorg_config dummy
+      launch_xorg_process || return 1
+    fi
+    start_input_bridge || return 1
+  elif [ "${ACTIVE_DISPLAY_DRIVER}" = "modesetting" ] && [ -e "${CARD_NODE}" ]; then
+    write_xorg_config "${ACTIVE_DISPLAY_DRIVER}"
+    if ! launch_xorg_process; then
+      stop_xorg_process
+      log "GPU modesetting display failed; falling back to dummy Xorg."
+      write_xorg_config dummy
+      launch_xorg_process || return 1
+    fi
+  else
+    if [ "${DISPLAY_DRIVER}" != "dummy" ]; then
+      log "No connected DRM output found; using dummy Xorg for Plasma."
+    fi
+    write_xorg_config dummy
+    launch_xorg_process || return 1
+  fi
+
+  launch_plasma_process
+}
+
+start_sunshine() {
+  if [ -n "${SUNSHINE_VAAPI_DRIVER:-}" ]; then
+    export LIBVA_DRIVER_NAME="${SUNSHINE_VAAPI_DRIVER}"
+  fi
+
+  run_as_desktop_user sunshine "${CONFIG_DIR}/sunshine.conf" >"${LOG_DIR}/sunshine.stdout.log" 2>&1 &
+  SUNSHINE_PID=$!
+}
+
+shutdown() {
+  [ -n "${SUNSHINE_PID:-}" ] && kill "${SUNSHINE_PID}" 2>/dev/null || true
+  stop_display_processes
+  [ -n "${INPUT_BRIDGE_PID:-}" ] && kill "${INPUT_BRIDGE_PID}" 2>/dev/null || true
+  [ -n "${WIREPLUMBER_PID:-}" ] && kill "${WIREPLUMBER_PID}" 2>/dev/null || true
+  [ -n "${PIPEWIRE_PID:-}" ] && kill "${PIPEWIRE_PID}" 2>/dev/null || true
+  [ -n "${SYSTEM_DBUS_PID:-}" ] && kill "${SYSTEM_DBUS_PID}" 2>/dev/null || true
+  if mountpoint -q "${HOME_DIR}"; then
+    umount "${HOME_DIR}" 2>/dev/null || true
+  fi
+}
+
+process_status() {
+  local pid="${1:-}"
+
+  if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+    printf 'running'
+  else
+    printf 'stopped'
+  fi
+}
+
+last_matching_line() {
+  local pattern="$1"
+  local file="$2"
+
+  if [ -f "${file}" ]; then
+    grep -E "${pattern}" "${file}" | tail -n 1 || true
+  fi
+}
+
+encoder_summary() {
+  local file="${LOG_DIR}/sunshine.stdout.log"
+  local h264 hevc vendor
+
+  h264="$(last_matching_line 'Found H\.264 encoder' "${file}")"
+  hevc="$(last_matching_line 'Found HEVC encoder' "${file}")"
+  vendor="$(last_matching_line 'vaapi vendor' "${file}")"
+
+  if [ -n "${h264}" ] || [ -n "${hevc}" ]; then
+    printf '%s\n' "${h264##*Info: }"
+    printf '%s\n' "${hevc##*Info: }"
+  else
+    printf 'probing\n'
+  fi
+
+  if [ -n "${vendor}" ]; then
+    printf '%s\n' "${vendor##*Info: }"
+  fi
+}
+
+display_log_file() {
+  case "${ACTIVE_DISPLAY_DRIVER}" in
+    xwayland) printf '%s\n' "${LOG_DIR}/xwayland.log" ;;
+    *) printf '%s\n' "${LOG_DIR}/xorg.log" ;;
+  esac
+}
+
+wait_for_key() {
+  printf '\nPress any key to return.'
+  IFS= read -rsn1 _ || true
+}
+
+draw_ui() {
+  printf '\033[2J\033[H'
+  printf 'Arch Sunshine\n'
+  printf '==============\n\n'
+  printf 'Status\n'
+  printf '  Display   %s  KDE Plasma X11 %s on %s %sx%s\n' "$(process_status "${PLASMA_PID:-}")" "${ACTIVE_DISPLAY_DRIVER}" "${DISPLAY_NAME}" "${WIDTH}" "${HEIGHT}"
+  printf '  Sunshine  %s  https://<host-ip>:47990\n' "$(process_status "${SUNSHINE_PID:-}")"
+  printf '  Capture   x11 on %s\n' "${DISPLAY_NAME}"
+  printf '  User      %s / %s\n' "${DESKTOP_USER}" "${DESKTOP_USER}"
+  printf '  Data      %s\n\n' "${USER_DATA}"
+  printf 'Encoder\n'
+  encoder_summary | sed 's/^/  /'
+  printf '\nLogs\n'
+  printf '  Sunshine  %s\n' "${LOG_DIR}/sunshine.log"
+  printf '  Xorg      %s\n' "${LOG_DIR}/xorg.log"
+  printf '  Weston    %s\n' "${LOG_DIR}/weston.log"
+  printf '  Xwayland  %s\n' "${LOG_DIR}/xwayland.log"
+  printf '  Plasma    %s\n\n' "${LOG_DIR}/plasma.log"
+  printf 'Commands\n'
+  printf '  p  pair PIN from Moonlight\n'
+  printf '  l  show Sunshine log tail\n'
+  printf '  d  show display log tail\n'
+  printf '  t  show Steam launch log tail\n'
+  printf '  s  open shell as %s\n' "${DESKTOP_USER}"
+  printf '  q  quit\n\n'
+  printf 'Waiting for command... '
+}
+
+show_log_tail() {
+  local title="$1"
+  local file="$2"
+
+  printf '\033[2J\033[H'
+  printf '%s\n' "${title}"
+  printf '%s\n\n' "${file}"
+  if [ -f "${file}" ]; then
+    tail -n 40 "${file}"
+  else
+    printf 'Log file does not exist yet.\n'
+  fi
+  wait_for_key
+}
+
+pair_device() {
+  local body device http_code name pin response response_body
+
+  printf '\033[2J\033[H'
+  printf 'Pair Moonlight Device\n'
+  printf '=====================\n\n'
+  printf 'In Moonlight, choose Arch Sunshine and start pairing first.\n'
+  printf 'Then enter the PIN Moonlight shows here.\n\n'
+  printf 'Client name (Enter for Moonlight): '
+  IFS= read -r device || true
+  printf 'PIN (4 digits): '
+  IFS= read -r pin || true
+
+  if [[ ! "${pin}" =~ ^[0-9]{4}$ ]]; then
+    printf '\nPIN was not submitted: expected exactly 4 digits.\n'
+    wait_for_key
+    return
+  fi
+
+  name="$(printf '%s' "${device:-Moonlight}" | tr -cd '[:alnum:] ._-')"
+  if [ -z "${name}" ]; then
+    name=Moonlight
+  fi
+  body="$(printf '{"pin":"%s","name":"%s"}' "${pin}" "${name}")"
+
+  response="$(
+    curl -k -sS --connect-timeout 2 --max-time 8 \
+      -u "${WEB_UI_USER}:${WEB_UI_PASS}" \
+      -H 'Content-Type: application/json' \
+      -X POST https://127.0.0.1:47990/api/pin \
+      --data "${body}" \
+      -w '\n%{http_code}' 2>&1
+  )" || true
+
+  http_code="${response##*$'\n'}"
+  response_body="${response%$'\n'*}"
+  printf '%s device=%s pin-submitted http=%s response=%s\n' \
+    "$(date -Is)" "${name}" "${http_code}" "${response_body}" >> "${LOG_DIR}/pair.log"
+
+  if [ "${http_code}" = "200" ] && printf '%s' "${response_body}" | grep -q '"status"[[:space:]]*:[[:space:]]*true'; then
+    printf '\nPairing accepted by Sunshine.\n'
+  else
+    printf '\nPairing was not accepted by Sunshine.\n\n'
+    printf '%s\n' "${response_body}"
+    printf '\nMake sure Moonlight is actively showing the PIN for Arch Sunshine, not Wolf.\n'
+  fi
+  wait_for_key
+}
+
+open_shell() {
+  printf '\033[2J\033[H'
+  printf 'Container shell as %s. Password for sudo is %s. Type exit to return.\n\n' "${DESKTOP_USER}" "${DESKTOP_USER}"
+  run_as_desktop_user /bin/bash || true
+}
+
+run_ui_loop() {
+  local key
+
+  while true; do
+    if ! kill -0 "${PLASMA_PID}" 2>/dev/null; then
+      printf '\nDisplay process exited.\n'
+      return
+    fi
+    if ! kill -0 "${SUNSHINE_PID}" 2>/dev/null; then
+      printf '\nSunshine process exited.\n'
+      return
+    fi
+
+    draw_ui
+    IFS= read -rsn1 -t 1 key || key=""
+    case "${key}" in
+      p|P) pair_device ;;
+      l|L) show_log_tail "Sunshine Log" "${LOG_DIR}/sunshine.log" ;;
+      d|D) show_log_tail "Display Log" "$(display_log_file)" ;;
+      t|T) show_log_tail "Steam Launch Log" "${HOME_DIR}/.local/share/Steam/logs/arch-sunshine-launch.log" ;;
+      s|S) open_shell ;;
+      q|Q) printf '\nStopping Arch Sunshine.\n'; return ;;
+      *) ;;
+    esac
+  done
+}
+
+run_daemon_loop() {
+  while true; do
+    if ! kill -0 "${PLASMA_PID}" 2>/dev/null; then
+      log "Display process exited"
+      break
+    fi
+    if ! kill -0 "${SUNSHINE_PID}" 2>/dev/null; then
+      log "Sunshine process exited"
+      break
+    fi
+    sleep 1
+  done
+}
+
+main() {
+  setup_user_data
+  seed_web_credentials
+  start_display || {
+    log "KDE Plasma display failed to start"
+    log "Xorg logs: ${LOG_DIR}/xorg.log"
+    log "Weston logs: ${LOG_DIR}/weston.log"
+    log "Xwayland logs: ${LOG_DIR}/xwayland.log"
+    log "Plasma logs: ${LOG_DIR}/plasma.log"
+    exit 1
+  }
+  start_sunshine
+
+  trap shutdown INT TERM EXIT
+
+  log "Arch Sunshine"
+  log "Display: KDE Plasma X11 ${ACTIVE_DISPLAY_DRIVER} on ${DISPLAY_NAME} (${WIDTH}x${HEIGHT})"
+  log "Encoder: Sunshine auto-select"
+  log "Sunshine web UI: https://<host-ip>:47990"
+  log "Sunshine logs: ${LOG_DIR}/sunshine.log"
+  log "Xorg logs: ${LOG_DIR}/xorg.log"
+  log "Weston logs: ${LOG_DIR}/weston.log"
+  log "Xwayland logs: ${LOG_DIR}/xwayland.log"
+  log "Plasma logs: ${LOG_DIR}/plasma.log"
+
+  if [ -t 0 ]; then
+    sleep 1
+    run_ui_loop
+  else
+    run_daemon_loop
+  fi
+
+  shutdown
+  wait "${SUNSHINE_PID}" 2>/dev/null || true
+  wait "${PLASMA_PID}" 2>/dev/null || true
+  wait "${XORG_PID}" 2>/dev/null || true
+  wait "${XWAYLAND_PID}" 2>/dev/null || true
+  wait "${WESTON_PID}" 2>/dev/null || true
+}
+
+main "$@"

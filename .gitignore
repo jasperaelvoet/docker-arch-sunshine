@@ -1,0 +1,13 @@
+# Runtime data
+/mnt/
+/data/
+
+# Local/editor files
+.DS_Store
+._*
+.vscode/
+
+# Generated files
+*.log
+__pycache__/
+*.py[cod]

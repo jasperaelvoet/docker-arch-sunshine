@@ -1,0 +1,10 @@
+.git
+.github
+.DS_Store
+._*
+*.log
+/mnt
+/data
+.vscode
+__pycache__
+*.pyc
