@@ -31,6 +31,10 @@ XORG_CONFIG="${LOG_DIR}/xorg.conf"
 SESSION_RUNTIME_DIR=/run/arch-sunshine
 SESSION_STATE_FILE="${SESSION_RUNTIME_DIR}/session.env"
 SESSION_LOCK_DIR="${SESSION_RUNTIME_DIR}/session.lock.d"
+DISCONNECT_DESKTOP_FILE="${HOME_DIR}/.local/share/applications/arch-sunshine-disconnect.desktop"
+DISCONNECT_DESKTOP_ICON="${HOME_DIR}/Desktop/arch-sunshine-disconnect.desktop"
+DISCONNECT_PANEL_MARKER="${HOME_DIR}/.config/arch-sunshine-disconnect-panel-added"
+STEAM_SEED_DIR=/usr/share/arch-sunshine/steam/Steam
 WEB_UI_USER=sunshine
 WEB_UI_PASS=sunshine
 
@@ -293,6 +297,29 @@ terminate_pid() {
   kill -KILL "${pid}" 2>/dev/null || true
 }
 
+terminate_pid_tree() {
+  local child pid="$1"
+
+  if [ -z "${pid}" ] || ! kill -0 "${pid}" 2>/dev/null; then
+    return 0
+  fi
+
+  for child in $(pgrep -P "${pid}" 2>/dev/null || true); do
+    terminate_pid_tree "${child}"
+  done
+
+  terminate_pid "${pid}"
+}
+
+terminate_desktop_user_processes_named() {
+  local name="$1"
+  local pid
+
+  for pid in $(pgrep -u "${DESKTOP_UID}" -x "${name}" 2>/dev/null || true); do
+    terminate_pid_tree "${pid}"
+  done
+}
+
 acquire_session_lock() {
   local owner waited
 
@@ -488,6 +515,8 @@ setup_user_data() {
   rm -rf "${HOME_DIR}/.config/session"
   normalize_desktop_paths
   seed_konsole_profile
+  seed_steam_install
+  seed_disconnect_launcher
   cat > "${HOME_DIR}/.config/ksplashrc" <<EOF
 [KSplash]
 Engine=none
@@ -537,6 +566,73 @@ EOF
 seed_web_credentials() {
   run_as_desktop_user sunshine "${CONFIG_DIR}/sunshine.conf" --creds "${WEB_UI_USER}" "${WEB_UI_PASS}" \
     >"${LOG_DIR}/credentials.log" 2>&1
+}
+
+seed_disconnect_launcher() {
+  mkdir -p "$(dirname "${DISCONNECT_DESKTOP_FILE}")" "$(dirname "${DISCONNECT_DESKTOP_ICON}")"
+
+  cat > "${DISCONNECT_DESKTOP_FILE}" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Disconnect
+Comment=Close the Moonlight stream and stop the desktop session
+Exec=/usr/local/bin/arch-sunshine disconnect
+Icon=system-log-out
+Terminal=false
+Categories=System;
+StartupNotify=false
+NoDisplay=false
+EOF
+
+  cp "${DISCONNECT_DESKTOP_FILE}" "${DISCONNECT_DESKTOP_ICON}"
+  chmod 644 "${DISCONNECT_DESKTOP_FILE}"
+  chmod 755 "${DISCONNECT_DESKTOP_ICON}"
+  chown "${DESKTOP_UID}:${DESKTOP_GID}" "${DISCONNECT_DESKTOP_FILE}" "${DISCONNECT_DESKTOP_ICON}"
+}
+
+rewrite_steam_seed_links() {
+  local link suffix target
+
+  while IFS= read -r -d '' link; do
+    target="$(readlink "${link}" 2>/dev/null || true)"
+    case "${target}" in
+      */.local/share/Steam/*)
+        suffix="${target#*/.local/share/Steam/}"
+        ln -sfn "${HOME_DIR}/.local/share/Steam/${suffix}" "${link}"
+        ;;
+    esac
+  done < <(find "${PERSISTENT_HOME_DIR}/.local/share/Steam" -type l -print0 2>/dev/null)
+}
+
+ensure_steam_links() {
+  local steam_config="${PERSISTENT_HOME_DIR}/.steam"
+
+  mkdir -p "${steam_config}"
+  ln -sfn "${HOME_DIR}/.local/share/Steam" "${steam_config}/steam"
+  ln -sfn "${HOME_DIR}/.local/share/Steam" "${steam_config}/root"
+  ln -sfn "${HOME_DIR}/.local/share/Steam/ubuntu12_32" "${steam_config}/bin32"
+  ln -sfn "${HOME_DIR}/.local/share/Steam/ubuntu12_64" "${steam_config}/bin64"
+  ln -sfn "${HOME_DIR}/.local/share/Steam/linux32" "${steam_config}/sdk32"
+  ln -sfn "${HOME_DIR}/.local/share/Steam/linux64" "${steam_config}/sdk64"
+  ln -sfn "${HOME_DIR}/.steam/bin32" "${steam_config}/bin"
+  rm -f "${steam_config}/steam.pid" "${steam_config}/steam.pipe" "${steam_config}/steam.token"
+}
+
+seed_steam_install() {
+  local steam_dir="${PERSISTENT_HOME_DIR}/.local/share/Steam"
+
+  if [ ! -x "${steam_dir}/steam.sh" ] && [ -x "${STEAM_SEED_DIR}/steam.sh" ]; then
+    log "Seeding Steam client into ${steam_dir}."
+    rm -rf "${steam_dir}"
+    mkdir -p "$(dirname "${steam_dir}")"
+    cp -a "${STEAM_SEED_DIR}" "${steam_dir}"
+    rewrite_steam_seed_links
+  fi
+
+  if [ -d "${steam_dir}" ]; then
+    ensure_steam_links
+    chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${steam_dir}" "${PERSISTENT_HOME_DIR}/.steam"
+  fi
 }
 
 write_desktop_env() {
@@ -641,6 +737,118 @@ apply_desktop_scale_runtime() {
     >>"${LOG_DIR}/scale.log" 2>&1 || true
   run_as_desktop_user qdbus6 org.kde.KWin /Compositor suspend \
     >>"${LOG_DIR}/scale.log" 2>&1 || true
+}
+
+ensure_disconnect_panel_button() {
+  local launcher_url output script
+
+  if [ -f "${DISCONNECT_PANEL_MARKER}" ] || [ ! -f "${DISCONNECT_DESKTOP_FILE}" ]; then
+    return 0
+  fi
+
+  command -v qdbus6 >/dev/null 2>&1 || return 0
+  launcher_url="file://${DISCONNECT_DESKTOP_FILE}"
+  script="$(cat <<EOF
+var result = "arch-sunshine-disconnect-no-panel";
+var panelList = panels();
+if (panelList.length > 0) {
+    var widget = panelList[0].addWidget("org.kde.plasma.icon");
+    widget.currentConfigGroup = ["General"];
+    widget.writeConfig("url", "${launcher_url}");
+    result = "arch-sunshine-disconnect-added";
+}
+print(result);
+result;
+EOF
+)"
+
+  if output="$(
+    run_as_desktop_user qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "${script}" 2>&1
+  )"; then
+    printf '%s\n' "${output}" >"${LOG_DIR}/disconnect-panel.log"
+  else
+    printf '%s\n' "${output}" >"${LOG_DIR}/disconnect-panel.log"
+    return 0
+  fi
+
+  sleep 0.2
+  if printf '%s\n' "${output}" | grep -q 'arch-sunshine-disconnect-added' \
+    || grep -Fqx "url=${launcher_url}" "${HOME_DIR}/.config/plasma-org.kde.plasma.desktop-appletsrc" 2>/dev/null; then
+    touch "${DISCONNECT_PANEL_MARKER}"
+    chown "${DESKTOP_UID}:${DESKTOP_GID}" "${DISCONNECT_PANEL_MARKER}"
+  fi
+}
+
+ensure_panel_task_launchers() {
+  local applet_group group_args group_part launchers output script
+
+  launchers="applications:org.kde.dolphin.desktop,applications:firefox.desktop,applications:steam.desktop"
+
+  if command -v kwriteconfig6 >/dev/null 2>&1 && [ -f "${HOME_DIR}/.config/plasma-org.kde.plasma.desktop-appletsrc" ]; then
+    while IFS= read -r applet_group; do
+      applet_group="${applet_group#[}"
+      applet_group="${applet_group%]}"
+      group_args=()
+      while IFS= read -r group_part; do
+        group_args+=(--group "${group_part}")
+      done < <(printf '%s\n' "${applet_group}" | sed 's/]\[/\n/g')
+
+      run_as_desktop_user kwriteconfig6 \
+        --file "${HOME_DIR}/.config/plasma-org.kde.plasma.desktop-appletsrc" \
+        "${group_args[@]}" \
+        --group Configuration \
+        --group General \
+        --key launchers \
+        "${launchers}" >/dev/null 2>&1 || true
+    done < <(
+      awk '
+        /^\[Containments\]\[[^]]+\]\[Applets\]\[[^]]+\]$/ {
+          group = $0
+          in_group = 1
+          next
+        }
+        /^\[/ {
+          in_group = 0
+        }
+        in_group && $0 == "plugin=org.kde.plasma.icontasks" {
+          print group
+        }
+      ' "${HOME_DIR}/.config/plasma-org.kde.plasma.desktop-appletsrc"
+    )
+  fi
+
+  command -v qdbus6 >/dev/null 2>&1 || return 0
+  script="$(cat <<EOF
+var launchers = "${launchers}";
+var changed = 0;
+panels().forEach(function(panel) {
+    panel.widgets().forEach(function(widget) {
+        var plugin = widget.type || widget.pluginName || "";
+        if (plugin == "org.kde.plasma.icontasks") {
+            widget.currentConfigGroup = ["General"];
+            widget.writeConfig("launchers", launchers);
+            changed++;
+        }
+    });
+});
+print("arch-sunshine-panel-launchers-set=" + changed);
+"arch-sunshine-panel-launchers-set=" + changed;
+EOF
+)"
+
+  for _ in $(seq 1 50); do
+    if output="$(
+      run_as_desktop_user qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "${script}" 2>&1
+    )"; then
+      printf '%s\n' "${output}" >"${LOG_DIR}/panel-launchers.log"
+      if printf '%s\n' "${output}" | grep -q 'arch-sunshine-panel-launchers-set=[1-9]'; then
+        return 0
+      fi
+    else
+      printf '%s\n' "${output}" >"${LOG_DIR}/panel-launchers.log"
+    fi
+    sleep 0.2
+  done
 }
 
 write_xorg_config() {
@@ -807,12 +1015,12 @@ launch_xorg_process() {
   XORG_PID=$!
 
   for _ in $(seq 1 100); do
+    if ! kill -0 "${XORG_PID}" 2>/dev/null; then
+      return 1
+    fi
     if DISPLAY="${DISPLAY_NAME}" xdpyinfo >/dev/null 2>&1; then
       configure_xrandr_monitor
       return 0
-    fi
-    if ! kill -0 "${XORG_PID}" 2>/dev/null; then
-      return 1
     fi
     sleep 0.1
   done
@@ -865,13 +1073,13 @@ launch_xwayland_process() {
   XWAYLAND_PID=$!
 
   for _ in $(seq 1 100); do
+    if ! kill -0 "${XWAYLAND_PID}" 2>/dev/null; then
+      return 1
+    fi
     if DISPLAY="${DISPLAY_NAME}" xdpyinfo >/dev/null 2>&1; then
       configure_xrandr_monitor
       DISPLAY="${DISPLAY_NAME}" xset s off -dpms >/dev/null 2>&1 || true
       return 0
-    fi
-    if ! kill -0 "${XWAYLAND_PID}" 2>/dev/null; then
-      return 1
     fi
     sleep 0.1
   done
@@ -881,7 +1089,7 @@ launch_xwayland_process() {
 
 stop_xorg_process() {
   if [ -n "${XORG_PID:-}" ]; then
-    terminate_pid "${XORG_PID}"
+    terminate_pid_tree "${XORG_PID}"
   fi
   XORG_PID=""
 
@@ -891,14 +1099,18 @@ stop_xorg_process() {
 
 stop_xwayland_process() {
   if [ -n "${XWAYLAND_PID:-}" ]; then
-    terminate_pid "${XWAYLAND_PID}"
+    terminate_pid_tree "${XWAYLAND_PID}"
   fi
   XWAYLAND_PID=""
+  terminate_desktop_user_processes_named Xwayland
 
   if [ -n "${WESTON_PID:-}" ]; then
-    terminate_pid "${WESTON_PID}"
+    terminate_pid_tree "${WESTON_PID}"
   fi
   WESTON_PID=""
+  terminate_desktop_user_processes_named weston
+  terminate_desktop_user_processes_named weston-keyboard
+  terminate_desktop_user_processes_named weston-desktop-
 
   rm -f /tmp/.X"${DISPLAY_NUM}"-lock
   rm -f /tmp/.X11-unix/X"${DISPLAY_NUM}"
@@ -1132,6 +1344,8 @@ start_desktop_services() {
   write_kde_session_config
   launch_plasma_process || return 1
   apply_desktop_scale_runtime
+  ensure_panel_task_launchers
+  ensure_disconnect_panel_button
 }
 
 start_display() {
@@ -1216,11 +1430,13 @@ desktop_session_live() {
 x_display_size_matches() {
   local actual
 
-  actual="$(
-    DISPLAY="${DISPLAY_NAME}" xdpyinfo 2>/dev/null \
-      | awk '/dimensions:/ { print $2; exit }'
-  )"
+  actual="$(current_x_display_size)"
   [ "${actual}" = "${WIDTH}x${HEIGHT}" ]
+}
+
+current_x_display_size() {
+  DISPLAY="${DISPLAY_NAME}" xdpyinfo 2>/dev/null \
+    | awk '/dimensions:/ { print $2; exit }'
 }
 
 stop_desktop_user_processes() {
@@ -1319,6 +1535,12 @@ session_start_locked() {
     fi
   fi
 
+  if ! x_display_size_matches; then
+    log "Capture display is $(current_x_display_size || printf unknown), not requested ${WIDTH}x${HEIGHT}; refusing to start a mismatched stream."
+    stop_desktop_runtime
+    return 1
+  fi
+
   if ! start_desktop_services; then
     log "Desktop session failed to start at ${WIDTH}x${HEIGHT}@${REFRESH_RATE}."
     stop_desktop_services
@@ -1403,6 +1625,32 @@ client_session_stop() {
 
   setsid -f /usr/bin/sudo -n /usr/local/bin/arch-sunshine session-stop \
     >>"${LOG_DIR}/client-stop.log" 2>&1 </dev/null
+}
+
+disconnect_session() {
+  local http_code response response_body
+
+  mkdir -p "${LOG_DIR}" 2>/dev/null || true
+
+  response="$(
+    curl -k -sS --connect-timeout 1 --max-time 3 \
+      -u "${WEB_UI_USER}:${WEB_UI_PASS}" \
+      -H 'Content-Type: application/json' \
+      -X POST https://127.0.0.1:47990/api/apps/close \
+      --data '{}' \
+      -w '\n%{http_code}' 2>&1
+  )" || true
+
+  http_code="${response##*$'\n'}"
+  response_body="${response%$'\n'*}"
+  printf '%s http=%s response=%s\n' "$(date -Is)" "${http_code}" "${response_body}" \
+    >>"${LOG_DIR}/disconnect.log" 2>/dev/null || true
+
+  if [ "${http_code}" = "200" ] && printf '%s' "${response_body}" | grep -q '"status"[[:space:]]*:[[:space:]]*true'; then
+    return 0
+  fi
+
+  client_session_stop
 }
 
 shutdown() {
@@ -1668,6 +1916,9 @@ case "${1:-}" in
     ;;
   client-stop)
     client_session_stop
+    ;;
+  disconnect)
+    disconnect_session
     ;;
   session-start)
     shift

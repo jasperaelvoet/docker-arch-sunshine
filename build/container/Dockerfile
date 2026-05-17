@@ -72,6 +72,7 @@ RUN printf '\nDisableSandbox\n\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n
       xdg-utils \
       xf86-input-libinput \
       xf86-video-dummy \
+      xorg-server-xvfb \
       xorg-server \
       xorg-xauth \
       xorg-xdpyinfo \
@@ -80,6 +81,7 @@ RUN printf '\nDisableSandbox\n\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n
       xorg-xset \
       xorg-xsetroot \
       xorg-xwayland \
+      xterm \
     && curl -fsSL -o /tmp/sunshine.pkg.tar.zst "https://github.com/LizardByte/Sunshine/releases/download/v${SUNSHINE_VERSION}/sunshine-${SUNSHINE_VERSION}-1-x86_64.pkg.tar.zst" \
     && printf '\nLocalFileSigLevel = Never\n' >> /etc/pacman.conf \
     && pacman -U --noconfirm /tmp/sunshine.pkg.tar.zst \
@@ -117,6 +119,9 @@ RUN sed -i '/^\[multilib\]$/,$ { /^LocalFileSigLevel = Never$/d; }' /etc/pacman.
 RUN sed -i 's/^#\(en_US\.UTF-8 UTF-8\)/\1/' /etc/locale.gen \
     && locale-gen \
     && printf 'LANG=en_US.UTF-8\n' > /etc/locale.conf
+
+COPY --chmod=755 build/container/bin/arch-sunshine-preseed-steam /usr/local/bin/arch-sunshine-preseed-steam
+RUN /usr/local/bin/arch-sunshine-preseed-steam
 
 COPY config/sunshine/ /usr/share/arch-sunshine/sunshine/
 COPY --chmod=755 build/container/bin/arch-sunshine /usr/local/bin/arch-sunshine

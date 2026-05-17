@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SEED_HOME=/var/lib/arch-sunshine-steam-seed
+SEED_OUT=/usr/share/arch-sunshine/steam
+STEAM_DIR="${SEED_HOME}/.local/share/Steam"
+LOG_FILE=/var/log/arch-sunshine-preseed-steam.log
+
+rm -rf "${SEED_HOME}" "${SEED_OUT}" "${LOG_FILE}"
+install -d -o sunshine -g sunshine \
+  "${SEED_HOME}" \
+  "${SEED_HOME}/.local/share" \
+  "${SEED_HOME}/.steam" \
+  "${SEED_HOME}/.config" \
+  "${SEED_HOME}/.cache" \
+  "${SEED_HOME}/Desktop"
+
+runuser -u sunshine -- env \
+  "HOME=${SEED_HOME}" \
+  "USER=sunshine" \
+  "LOGNAME=sunshine" \
+  "STEAM_DIR=${STEAM_DIR}" \
+  "XDG_DATA_HOME=${SEED_HOME}/.local/share" \
+  "XDG_CONFIG_HOME=${SEED_HOME}/.config" \
+  "XDG_CACHE_HOME=${SEED_HOME}/.cache" \
+  bash -lc '
+    set -euo pipefail
+    mkdir -p "${STEAM_DIR}" "${HOME}/.steam"
+    cd "${STEAM_DIR}"
+    tar xJf /usr/lib/steam/bootstraplinux_ubuntu12_32.tar.xz
+    cp /usr/lib/steam/bootstraplinux_ubuntu12_32.tar.xz "${STEAM_DIR}/bootstrap.tar.xz"
+    ln -fns "${STEAM_DIR}" "${HOME}/.steam/steam"
+    ln -fns "${STEAM_DIR}" "${HOME}/.steam/root"
+  '
+
+runuser -u sunshine -- env \
+  "HOME=${SEED_HOME}" \
+  "USER=sunshine" \
+  "LOGNAME=sunshine" \
+  "STEAM_DIR=${STEAM_DIR}" \
+  "XDG_DATA_HOME=${SEED_HOME}/.local/share" \
+  "XDG_CONFIG_HOME=${SEED_HOME}/.config" \
+  "XDG_CACHE_HOME=${SEED_HOME}/.cache" \
+  "STEAM_RUNTIME=1" \
+  "STEAM_RUNTIME_LOGGER=0" \
+  bash -lc 'cd "${STEAM_DIR}" && xvfb-run -a -s "-screen 0 1280x720x24" "${STEAM_DIR}/ubuntu12_32/steam" -silent' \
+  >"${LOG_FILE}" 2>&1 &
+steam_pid=$!
+
+steam_preseed_ready() {
+  grep -q 'Update complete, launching' "${bootstrap_log}" 2>/dev/null \
+    && [ -f "${STEAM_DIR}/package/steam_client_ubuntu12.installed" ] \
+    && [ -x "${STEAM_DIR}/steam.sh" ] \
+    && [ -x "${STEAM_DIR}/ubuntu12_32/steam" ]
+}
+
+deadline=$((SECONDS + 900))
+bootstrap_log="${STEAM_DIR}/logs/bootstrap_log.txt"
+while [ "${SECONDS}" -lt "${deadline}" ]; do
+  if steam_preseed_ready; then
+    break
+  fi
+
+  if ! kill -0 "${steam_pid}" 2>/dev/null; then
+    break
+  fi
+
+  sleep 2
+done
+
+pkill -TERM -u sunshine -f "${STEAM_DIR}" 2>/dev/null || true
+sleep 2
+pkill -KILL -u sunshine -f "${STEAM_DIR}" 2>/dev/null || true
+wait "${steam_pid}" 2>/dev/null || true
+
+if ! steam_preseed_ready; then
+  tail -120 "${LOG_FILE}" >&2 || true
+  tail -120 "${bootstrap_log}" >&2 || true
+  printf '%s\n' 'Steam preseed did not finish.' >&2
+  exit 1
+fi
+
+rm -rf \
+  "${STEAM_DIR}/.crash" \
+  "${STEAM_DIR}/logs"/* \
+  "${STEAM_DIR}/config/htmlcache/SingletonCookie" \
+  "${STEAM_DIR}/config/htmlcache/SingletonLock" \
+  "${STEAM_DIR}/config/htmlcache/SingletonSocket" \
+  "${SEED_HOME}/.steam/steam.pid" \
+  "${SEED_HOME}/.steam/steam.pipe" \
+  "${SEED_HOME}/.steam/steam.token"
+
+install -d -m 755 "${SEED_OUT}"
+cp -a "${STEAM_DIR}" "${SEED_OUT}/Steam"
+chown -R root:root "${SEED_OUT}"
+rm -rf "${SEED_HOME}"

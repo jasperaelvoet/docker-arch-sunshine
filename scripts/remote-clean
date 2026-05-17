@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REMOTE="${REMOTE:-root@10.10.10.122}"
+REMOTE_DIR="${REMOTE_DIR:-/root/docker-games}"
+REMOTE_CONTAINER="${REMOTE_CONTAINER:-docker-arch-sunshine}"
+SSH="${SSH:-ssh}"
+
+usage() {
+  cat <<EOF
+Usage: scripts/remote-clean
+
+Stops the remote container and removes remote persisted runtime data.
+
+Environment overrides:
+  REMOTE=host              default: ${REMOTE}
+  REMOTE_DIR=path          default: ${REMOTE_DIR}
+  REMOTE_CONTAINER=name    default: ${REMOTE_CONTAINER}
+EOF
+}
+
+case "${1:-}" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  "")
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
+
+printf 'cleaning remote container and data on %s:%s\n' "${REMOTE}" "${REMOTE_DIR}"
+"${SSH}" "${REMOTE}" "
+  set -eu
+  if [ -d '${REMOTE_DIR}' ]; then
+    cd '${REMOTE_DIR}'
+    if [ -f compose.yaml ]; then
+      docker compose -f compose.yaml down --remove-orphans
+    else
+      docker rm -f '${REMOTE_CONTAINER}' 2>/dev/null || true
+    fi
+    rm -rf ./mnt/user_data ./mnt/arch-root
+  else
+    docker rm -f '${REMOTE_CONTAINER}' 2>/dev/null || true
+  fi
+"

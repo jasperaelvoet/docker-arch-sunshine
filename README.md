@@ -13,6 +13,8 @@ for GPU-backed desktop capture on headless Linux hosts.
 - Persistent desktop, Steam, and Sunshine state in `./mnt/user_data`
 - Stream-triggered desktop wake/sleep so idle containers keep only Sunshine and
   a lightweight X11 capture display up
+- Plasma Disconnect launcher for closing the Moonlight stream and sleeping the
+  desktop session
 
 ## Requirements
 
@@ -47,6 +49,7 @@ truth.
 make remote-dev      # sync, rebuild on remote, and attach
 make remote-sync     # sync files only
 make remote-watch    # keep syncing local edits to remote
+make remote-clean    # stop remote container and remove remote persisted data
 ```
 
 Override the target if needed:
@@ -74,3 +77,5 @@ ends. Plasma scaling defaults to `auto`, derived from the requested stream
 resolution, and can be overridden with `SUNSHINE_SCALE` such as `1`, `1.5`, or
 `2`. The fallback capture display defaults to 1920x1080 before a client request
 is available, and can be overridden with `SUNSHINE_WIDTH` and `SUNSHINE_HEIGHT`.
+Plasma's lock and logout actions are hidden; use the Disconnect launcher on the
+desktop or panel to close a Moonlight session.

@@ -1,7 +1,7 @@
 REMOTE ?= root@10.10.10.122
 REMOTE_DIR ?= /root/docker-games
 
-.PHONY: dev clean remote-sync remote-rebuild remote-dev remote-watch
+.PHONY: dev clean remote-sync remote-rebuild remote-dev remote-watch remote-clean
 
 dev:
 	docker compose -f compose.yaml down --remove-orphans
@@ -23,3 +23,6 @@ remote-dev:
 
 remote-watch:
 	REMOTE="$(REMOTE)" REMOTE_DIR="$(REMOTE_DIR)" ./scripts/remote-sync watch
+
+remote-clean:
+	REMOTE="$(REMOTE)" REMOTE_DIR="$(REMOTE_DIR)" ./scripts/remote-clean
