@@ -50,10 +50,15 @@ run_as_desktop_user() {
     "KDE_FULL_SESSION=true"
     "QT_QPA_PLATFORM=xcb"
     "LIBGL_DRI3_ENABLE=1"
+    "PULSE_SERVER=unix:${RUNTIME_DIR}/pulse/native"
     "SDL_VIDEODRIVER=x11"
     "STEAM_RUNTIME=1"
     "DISPLAY=${DISPLAY_NAME}"
   )
+
+  if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    env_args+=("DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}")
+  fi
 
   if [ -n "${SUNSHINE_VAAPI_DRIVER:-}" ]; then
     env_args+=("LIBVA_DRIVER_NAME=${SUNSHINE_VAAPI_DRIVER}")
@@ -121,23 +126,6 @@ EOF
       -e "s|file://${USER_DATA}/home/retro|file://${HOME_DIR}|g" \
       -e "s|file://${PERSISTENT_HOME_DIR}|file://${HOME_DIR}|g" \
       "${places}"
-  fi
-}
-
-seed_desktop_launchers() {
-  local steam_desktop="${HOME_DIR}/.local/share/applications/steam.desktop"
-
-  if [ -f /usr/share/applications/steam.desktop ]; then
-    mkdir -p "${HOME_DIR}/.local/share/applications"
-    awk '
-      /^Exec=/ && !done {
-        print "Exec=/usr/local/bin/arch-sunshine-steam %U"
-        done = 1
-        next
-      }
-      { print }
-    ' /usr/share/applications/steam.desktop > "${steam_desktop}"
-    chmod 0644 "${steam_desktop}"
   fi
 }
 
@@ -257,12 +245,14 @@ setup_user_data() {
   set_config_value file_state "${STATE_DIR}/sunshine_state.json"
   set_config_value credentials_file "${STATE_DIR}/sunshine_state.json"
   set_config_value log_path "${LOG_DIR}/sunshine.log"
+  set_config_value stream_audio enabled
+  set_config_value audio_sink arch_sunshine_audio.monitor
+  set_config_value virtual_sink arch_sunshine_audio
   rm -f "${HOME_DIR}/.cache/ksycoca6"*
   rm -rf "${HOME_DIR}/.cache/menus"
   rm -rf "${HOME_DIR}/.local/share/kscreen"
   rm -rf "${HOME_DIR}/.config/session"
   normalize_desktop_paths
-  seed_desktop_launchers
   seed_konsole_profile
   cat > "${HOME_DIR}/.config/ksplashrc" <<EOF
 [KSplash]
@@ -329,6 +319,7 @@ export QT_QPA_PLATFORM=xcb
 export MOZ_ENABLE_WAYLAND=0
 export SDL_VIDEODRIVER=x11
 export LIBGL_DRI3_ENABLE=1
+export PULSE_SERVER=unix:${RUNTIME_DIR}/pulse/native
 EOF
   chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${HOME_DIR}/.config"
 }
@@ -594,7 +585,7 @@ stop_xwayland_process() {
 }
 
 launch_plasma_process() {
-  run_as_desktop_user dbus-run-session -- startplasma-x11 \
+  run_as_desktop_user startplasma-x11 \
     >"${LOG_DIR}/plasma.log" 2>&1 &
   PLASMA_PID=$!
 
@@ -649,12 +640,96 @@ start_system_bus() {
   return 1
 }
 
+start_session_bus() {
+  local output
+
+  rm -f "${RUNTIME_DIR}/bus"
+  output="$(
+    run_desktop_base dbus-daemon \
+      --session \
+      --fork \
+      --address="unix:path=${RUNTIME_DIR}/bus" \
+      --print-address \
+      --print-pid
+  )"
+  DBUS_SESSION_BUS_ADDRESS="$(printf '%s\n' "${output}" | sed -n '1p')"
+  SESSION_DBUS_PID="$(printf '%s\n' "${output}" | sed -n '2p')"
+  export DBUS_SESSION_BUS_ADDRESS
+
+  for _ in $(seq 1 50); do
+    if [ -S "${RUNTIME_DIR}/bus" ]; then
+      return 0
+    fi
+    if [ -n "${SESSION_DBUS_PID:-}" ] && ! kill -0 "${SESSION_DBUS_PID}" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  return 1
+}
+
 start_pipewire() {
   run_as_desktop_user pipewire >"${LOG_DIR}/pipewire.log" 2>&1 &
   PIPEWIRE_PID=$!
 
+  for _ in $(seq 1 50); do
+    if [ -S "${RUNTIME_DIR}/pipewire-0" ]; then
+      break
+    fi
+    if ! kill -0 "${PIPEWIRE_PID}" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  if [ ! -S "${RUNTIME_DIR}/pipewire-0" ]; then
+    return 1
+  fi
+
   run_as_desktop_user wireplumber >"${LOG_DIR}/wireplumber.log" 2>&1 &
   WIREPLUMBER_PID=$!
+
+  run_as_desktop_user pipewire-pulse >"${LOG_DIR}/pipewire-pulse.log" 2>&1 &
+  PIPEWIRE_PULSE_PID=$!
+
+  for _ in $(seq 1 50); do
+    if [ -S "${RUNTIME_DIR}/pulse/native" ]; then
+      break
+    fi
+    if ! kill -0 "${PIPEWIRE_PID}" 2>/dev/null || ! kill -0 "${PIPEWIRE_PULSE_PID}" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  if [ ! -S "${RUNTIME_DIR}/pulse/native" ]; then
+    return 1
+  fi
+
+  ensure_audio_sink
+}
+
+ensure_audio_sink() {
+  local pactl_env=(
+    "XDG_RUNTIME_DIR=${RUNTIME_DIR}"
+    "PULSE_SERVER=unix:${RUNTIME_DIR}/pulse/native"
+  )
+
+  if ! runuser -u "${DESKTOP_USER}" -- env "${pactl_env[@]}" pactl list short sinks \
+    | awk '{print $2}' | grep -qx arch_sunshine_audio; then
+    runuser -u "${DESKTOP_USER}" -- env "${pactl_env[@]}" pactl load-module module-null-sink \
+      sink_name=arch_sunshine_audio \
+      sink_properties=device.description=Arch_Sunshine_Audio \
+      >"${LOG_DIR}/audio-sink.log" 2>&1 || return 1
+  fi
+
+  runuser -u "${DESKTOP_USER}" -- env "${pactl_env[@]}" pactl list short sinks \
+    >"${LOG_DIR}/audio-sinks.log" 2>&1 || true
+  runuser -u "${DESKTOP_USER}" -- env "${pactl_env[@]}" pactl list short sources \
+    >"${LOG_DIR}/audio-sources.log" 2>&1 || true
+
+  return 0
 }
 
 start_input_bridge() {
@@ -695,7 +770,8 @@ start_display() {
     start_input_bridge || return 1
   fi
   start_system_bus || return 1
-  start_pipewire
+  start_session_bus || return 1
+  start_pipewire || return 1
 
   if [ "${ACTIVE_DISPLAY_DRIVER}" = "xwayland" ]; then
     write_desktop_env
@@ -739,7 +815,9 @@ shutdown() {
   stop_display_processes
   [ -n "${INPUT_BRIDGE_PID:-}" ] && kill "${INPUT_BRIDGE_PID}" 2>/dev/null || true
   [ -n "${WIREPLUMBER_PID:-}" ] && kill "${WIREPLUMBER_PID}" 2>/dev/null || true
+  [ -n "${PIPEWIRE_PULSE_PID:-}" ] && kill "${PIPEWIRE_PULSE_PID}" 2>/dev/null || true
   [ -n "${PIPEWIRE_PID:-}" ] && kill "${PIPEWIRE_PID}" 2>/dev/null || true
+  [ -n "${SESSION_DBUS_PID:-}" ] && kill "${SESSION_DBUS_PID}" 2>/dev/null || true
   [ -n "${SYSTEM_DBUS_PID:-}" ] && kill "${SYSTEM_DBUS_PID}" 2>/dev/null || true
   if mountpoint -q "${HOME_DIR}"; then
     umount "${HOME_DIR}" 2>/dev/null || true

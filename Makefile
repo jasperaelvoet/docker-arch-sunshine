@@ -3,7 +3,7 @@
 dev:
 	docker compose -f compose.yaml down --remove-orphans
 	docker compose -f compose.yaml up -d --build sunshine
-	docker attach arch-sunshine
+	docker attach docker-arch-sunshine
 
 clean:
 	docker compose -f compose.yaml down --remove-orphans

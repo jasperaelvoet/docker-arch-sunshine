@@ -95,6 +95,20 @@ RUN printf '\nDisableSandbox\n\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n
 RUN pacman -S --noconfirm --needed weston \
     && pacman -Scc --noconfirm
 
+RUN pacman -S --noconfirm --needed \
+      alsa-plugins \
+      alsa-utils \
+      lib32-alsa-lib \
+      lib32-alsa-plugins \
+      lib32-libpulse \
+      lib32-pipewire \
+      libpulse \
+      pipewire \
+      pipewire-alsa \
+      pipewire-pulse \
+      wireplumber \
+    && pacman -Scc --noconfirm
+
 RUN sed -i '/^\[multilib\]$/,$ { /^LocalFileSigLevel = Never$/d; }' /etc/pacman.conf
 
 RUN sed -i 's/^#\(en_US\.UTF-8 UTF-8\)/\1/' /etc/locale.gen \
@@ -104,7 +118,6 @@ RUN sed -i 's/^#\(en_US\.UTF-8 UTF-8\)/\1/' /etc/locale.gen \
 COPY config/sunshine/ /usr/share/arch-sunshine/sunshine/
 COPY --chmod=755 build/container/bin/arch-sunshine /usr/local/bin/arch-sunshine
 COPY --chmod=755 build/container/bin/arch-sunshine-input-bridge /usr/local/bin/arch-sunshine-input-bridge
-COPY --chmod=755 build/container/bin/arch-sunshine-steam /usr/local/bin/arch-sunshine-steam
 
 RUN install -d -m 1777 /var/lib/xkb \
     && mkdir -p /mnt/user_data \

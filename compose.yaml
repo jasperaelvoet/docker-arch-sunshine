@@ -3,8 +3,8 @@ services:
     build:
       context: .
       dockerfile: build/container/Dockerfile
-    image: arch-sunshine
-    container_name: arch-sunshine
+    image: docker-arch-sunshine
+    container_name: docker-arch-sunshine
     platform: linux/amd64
     stdin_open: true
     tty: true

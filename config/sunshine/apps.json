@@ -11,6 +11,7 @@
     "KDE_FULL_SESSION": "true",
     "QT_QPA_PLATFORM": "xcb",
     "LIBGL_DRI3_ENABLE": "1",
+    "PULSE_SERVER": "unix:/run/user/1000/pulse/native",
     "MOZ_ENABLE_WAYLAND": "0",
     "SDL_VIDEODRIVER": "x11",
     "STEAM_RUNTIME": "1"

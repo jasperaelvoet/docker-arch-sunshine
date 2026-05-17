@@ -1,7 +1,23 @@
-# Arch Sunshine
+# Docker Arch Sunshine
 
-Barebones Arch Linux desktop container with Sunshine, KDE Plasma, Steam, and
-Firefox.
+Arch Linux desktop container for Moonlight game streaming through Sunshine. It
+runs KDE Plasma with Steam and Firefox, persists user data locally, and is set up
+for GPU-backed desktop capture on headless Linux hosts.
+
+## What's included
+
+- Arch Linux desktop with KDE Plasma
+- Sunshine host for Moonlight pairing and streaming
+- Steam and Firefox launchers
+- PipeWire/PulseAudio audio capture for streams
+- Persistent desktop, Steam, and Sunshine state in `./mnt/user_data`
+
+## Requirements
+
+- Docker with the Compose plugin
+- Linux host with GPU devices exposed at `/dev/dri`
+- `/dev/uinput` and `/dev/uhid` available for input/controller passthrough
+- Host networking available for Sunshine and Moonlight discovery
 
 ## Usage
 
@@ -9,15 +25,9 @@ Firefox.
 make dev
 ```
 
-This builds the image, starts the container, and attaches to the small control
-UI. Pair from Moonlight, then press `p` in the terminal UI to enter the pairing
+This builds the image, starts the container, and attaches to the terminal control
+UI. Pair from Moonlight, then press `p` in the control UI to enter the pairing
 PIN.
-
-Persistent user data lives in:
-
-```text
-./mnt/user_data
-```
 
 ## Commands
 
@@ -28,10 +38,12 @@ make clean  # stop and remove persisted local data
 
 ## Defaults
 
+- Image/container: `docker-arch-sunshine`
 - Desktop user: `sunshine`
 - Desktop password: `sunshine`
 - Sunshine Web UI: `https://<host-ip>:47990`
 - Web UI login: `sunshine` / `sunshine`
+- Persistent data: `./mnt/user_data`
 
 The container uses the mounted GPU when available. On a headless GPU it runs
 KDE Plasma on GPU-backed Xwayland so Sunshine can still capture an X11 desktop.
