@@ -1,5 +1,26 @@
 # syntax=docker/dockerfile:1.7
 
+FROM --platform=linux/amd64 archlinux:base AS native-builder
+
+USER root
+
+RUN printf '\nDisableSandbox\n' >> /etc/pacman.conf \
+    && rm -rf /var/cache/pacman/pkg/* \
+    && pacman-key --init \
+    && pacman-key --populate archlinux \
+    && pacman -Syy --noconfirm archlinux-keyring \
+    && pacman -Syu --noconfirm --needed \
+      gcc \
+      glib2 \
+      libei \
+      pkgconf
+
+COPY build/container/src/ /usr/local/src/arch-sunshine/
+RUN mkdir -p /out \
+    && cc -O2 -pipe -Wall -Wextra -o /out/arch-sunshine-input-bridge /usr/local/src/arch-sunshine/arch-sunshine-input-bridge.c $(pkg-config --cflags --libs gio-2.0 gio-unix-2.0 libei-1.0) \
+    && cc -O2 -pipe -Wall -Wextra -o /out/arch-sunshine-server /usr/local/src/arch-sunshine/arch-sunshine-server.c \
+    && strip /out/arch-sunshine-input-bridge /out/arch-sunshine-server
+
 FROM --platform=linux/amd64 archlinux:base
 
 USER root
@@ -63,6 +84,7 @@ RUN printf '\nDisableSandbox\n\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n
       libva-intel-driver \
       libva-mesa-driver \
       libva-utils \
+      libei \
       libx11 \
       libxcb \
       libxfixes \
@@ -145,9 +167,9 @@ RUN /usr/local/bin/arch-sunshine-preseed-steam
 
 COPY config/sunshine/ /usr/share/arch-sunshine/
 COPY --chmod=755 build/container/bin/arch-sunshine /usr/local/bin/arch-sunshine
-COPY --chmod=755 build/container/bin/arch-sunshine-input-bridge /usr/local/bin/arch-sunshine-input-bridge
+COPY --from=native-builder /out/arch-sunshine-input-bridge /usr/local/bin/arch-sunshine-input-bridge
+COPY --from=native-builder /out/arch-sunshine-server /usr/local/bin/arch-sunshine-server
 COPY --chmod=755 build/container/bin/arch-sunshine-network-status /usr/local/bin/arch-sunshine-network-status
-COPY --chmod=755 build/container/bin/arch-sunshine-server /usr/local/bin/arch-sunshine-server
 COPY --chmod=755 build/container/bin/arch-sunshine-pacman /usr/local/bin/arch-sunshine-pacman
 COPY --chmod=755 build/container/bin/arch-sunshine-steam /usr/local/bin/arch-sunshine-steam
 COPY --chmod=755 build/container/bin/arch-sunshine-steamos-update /usr/local/bin/arch-sunshine-steamos-update

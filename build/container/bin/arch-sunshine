@@ -542,6 +542,17 @@ def run_kwriteconfig(env, file_name, groups, key, value):
     run_as_desktop_user(command, env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def sync_x11_resources(env):
+    if not command_available("kcminit"):
+        return
+    run_as_desktop_user(
+        ["kcminit", "kcm_fonts_init", "kcm_style_init"],
+        env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def update_kwin_output_config(width, height, fps, scale):
     config_path = HOME_DIR / ".config" / "kwinoutputconfig.json"
     try:
@@ -577,7 +588,7 @@ def apply_kde_scale_config(env, width, height, fps, scale, live=False):
     scale_text = plasma_scale_text(scale)
     run_kwriteconfig(env, "kdeglobals", ("KScreen",), "ScaleFactor", scale_text)
     run_kwriteconfig(env, "kdeglobals", ("KScreen",), "ScreenScaleFactors", plasma_screen_scale_factors(scale))
-    run_kwriteconfig(env, "kdeglobals", ("KScreen",), "XwaylandClientsScale", "false")
+    run_kwriteconfig(env, "kdeglobals", ("KScreen",), "XwaylandClientsScale", "true")
     run_kwriteconfig(env, "kdeglobals", ("General",), "Xft.dpi", plasma_scale_dpi(scale))
     run_kwriteconfig(env, "kwinrc", ("Xwayland",), "Scale", scale_text)
     update_kwin_output_config(width, height, fps, scale)
@@ -590,6 +601,8 @@ def apply_kde_scale_config(env, width, height, fps, scale, live=False):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+    if live:
+        sync_x11_resources(env)
 
 
 def apply_kde_session_tweaks(env):
@@ -1021,6 +1034,19 @@ class UInputTestDevice:
 
     def click_middle(self):
         self.click_button(self.BTN_MIDDLE)
+
+    def duplicate_middle_hold(self):
+        self.emit(self.EV_KEY, self.BTN_MIDDLE, 1)
+        self.sync()
+        time.sleep(0.05)
+        self.emit(self.EV_KEY, self.BTN_MIDDLE, 1)
+        self.sync()
+        time.sleep(0.05)
+        self.emit(self.EV_KEY, self.BTN_MIDDLE, 0)
+        self.sync()
+        time.sleep(0.05)
+        self.emit(self.EV_KEY, self.BTN_MIDDLE, 0)
+        self.sync()
 
     def click_right(self):
         self.click_button(self.BTN_RIGHT)
@@ -2004,26 +2030,39 @@ def command_input_test(args):
             device.click_middle()
             time.sleep(0.1)
             device.click_right()
+            time.sleep(0.1)
+            device.duplicate_middle_hold()
 
-        mouse_process.wait(timeout=args.timeout + 2)
+        deadline = time.monotonic() + args.timeout + 2
+        while time.monotonic() < deadline and mouse_process.poll() is None and not mouse_output.exists():
+            time.sleep(0.1)
+        terminate_process(mouse_process)
         mouse_bytes = mouse_output.read_bytes() if mouse_output.exists() else b""
         saw_left = b"\x1b[<0;" in mouse_bytes
         saw_middle = b"\x1b[<1;" in mouse_bytes
         saw_right = b"\x1b[<2;" in mouse_bytes
         saw_button = saw_left and saw_middle and saw_right
         saw_motion = b"\x1b[<35;" in mouse_bytes or b"\x1b[<32;" in mouse_bytes
+        middle_edges = mouse_bytes.count(b"\x1b[<1;")
+        deduped_hold = middle_edges == 4
 
-        print(f"input-test: motion={saw_motion} buttons=left:{saw_left},middle:{saw_middle},right:{saw_right} key={saw_key}")
+        print(
+            "input-test: "
+            f"motion={saw_motion} buttons=left:{saw_left},middle:{saw_middle},right:{saw_right} "
+            f"key={saw_key} deduped_hold={deduped_hold}"
+        )
         if not saw_motion:
             print("input-test: no pointer motion reached the focused terminal probe")
         if not saw_button:
             print("input-test: not all primary pointer buttons reached the focused terminal probe")
         if not saw_key:
             print(f"input-test: keyboard probe read {keyboard_text!r}, expected 'abc'")
+        if not deduped_hold:
+            print(f"input-test: duplicate hold generated {middle_edges} middle-button terminal events, expected 4")
         if args.verbose and mouse_bytes:
             print(f"input-test: mouse bytes {mouse_bytes!r}")
 
-        if args.require_all and not (saw_motion and saw_button and saw_key):
+        if args.require_all and not (saw_motion and saw_button and saw_key and deduped_hold):
             raise StreamError("input-test failed: bridged input events did not reach the Wayland clients")
         if not (saw_motion or saw_button or saw_key):
             raise StreamError("input-test failed: no bridged input events reached the Wayland clients")
