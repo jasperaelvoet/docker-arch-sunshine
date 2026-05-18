@@ -31,6 +31,7 @@ XORG_CONFIG="${LOG_DIR}/xorg.conf"
 SESSION_RUNTIME_DIR=/run/arch-sunshine
 SESSION_STATE_FILE="${SESSION_RUNTIME_DIR}/session.env"
 SESSION_LOCK_DIR="${SESSION_RUNTIME_DIR}/session.lock.d"
+RUNTIME_RESOLV_CONF="${SESSION_RUNTIME_DIR}/resolv.conf"
 DISCONNECT_DESKTOP_FILE="${HOME_DIR}/.local/share/applications/arch-sunshine-disconnect.desktop"
 DISCONNECT_DESKTOP_ICON="${HOME_DIR}/Desktop/arch-sunshine-disconnect.desktop"
 DISCONNECT_PANEL_MARKER="${HOME_DIR}/.config/arch-sunshine-disconnect-panel-added"
@@ -38,6 +39,7 @@ HOME_OWNERSHIP_MARKER="${PERSISTENT_HOME_DIR}/.config/arch-sunshine/ownership-v2
 STEAM_BOOTSTRAP_TAR=/usr/share/arch-sunshine/steam/bootstraplinux_ubuntu12_32.tar.xz
 WEB_UI_USER=sunshine
 WEB_UI_PASS=sunshine
+DNS_SERVERS="${SUNSHINE_DNS_SERVERS:-1.1.1.1 8.8.8.8}"
 
 log() {
   printf '%s\n' "$*"
@@ -64,6 +66,8 @@ run_as_desktop_user() {
     "KDE_FULL_SESSION=true"
     "KWIN_COMPOSE=N"
     "QT_QPA_PLATFORM=xcb"
+    "GIO_USE_NETWORK_MONITOR=base"
+    "RES_OPTIONS=timeout:1 attempts:2 rotate single-request-reopen"
     "LIBGL_DRI3_ENABLE=1"
     "PULSE_SERVER=unix:${RUNTIME_DIR}/pulse/native"
     "SDL_VIDEODRIVER=x11"
@@ -105,6 +109,58 @@ set_config_value() {
   else
     printf '%s = %s\n' "${key}" "${value}" >> "${file}"
   fi
+}
+
+configure_network_resolution() {
+  install -d -m 755 "${SESSION_RUNTIME_DIR}"
+
+  write_resolv_conf "${RUNTIME_RESOLV_CONF}" || log "Failed to write ${RUNTIME_RESOLV_CONF}; DNS may not work."
+
+  write_resolv_conf /etc/resolv.conf || {
+    umount /etc/resolv.conf 2>/dev/null || true
+    write_resolv_conf /etc/resolv.conf || true
+  }
+
+  if [ -w /etc/nsswitch.conf ] && grep -q '^hosts:' /etc/nsswitch.conf; then
+    sed -i -E 's/^hosts:.*/hosts: files mymachines myhostname dns resolve/' /etc/nsswitch.conf
+  fi
+
+  if [ -w /etc/gai.conf ]; then
+    grep -v -E '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+' /etc/gai.conf > /tmp/arch-sunshine-gai.conf
+    cat /tmp/arch-sunshine-gai.conf > /etc/gai.conf
+    rm -f /tmp/arch-sunshine-gai.conf
+    printf 'precedence ::ffff:0:0/96  100\n' >> /etc/gai.conf
+  fi
+
+  if command -v setcap >/dev/null 2>&1 && [ -x /usr/bin/ping ]; then
+    setcap cap_net_raw+ep /usr/bin/ping 2>/dev/null || chmod 4755 /usr/bin/ping 2>/dev/null || true
+  elif [ -x /usr/bin/ping ]; then
+    chmod 4755 /usr/bin/ping 2>/dev/null || true
+  fi
+}
+
+write_resolv_conf() {
+  local target="$1"
+  local server
+
+  {
+    printf '# Managed by arch-sunshine. Override with SUNSHINE_DNS_SERVERS.\n'
+    for server in ${DNS_SERVERS}; do
+      printf 'nameserver %s\n' "${server}"
+    done
+    printf 'options timeout:1 attempts:2 rotate single-request-reopen\n'
+  } > "${target}" 2>/dev/null || return 1
+
+  grep -q '^nameserver ' "${target}" 2>/dev/null
+}
+
+mount_runtime_resolv_conf() {
+  if [ ! -s "${RUNTIME_RESOLV_CONF}" ]; then
+    write_resolv_conf "${RUNTIME_RESOLV_CONF}" || return 1
+  fi
+
+  mount --bind "${RUNTIME_RESOLV_CONF}" /etc/resolv.conf 2>/dev/null || return 1
+  mount -o remount,bind,ro /etc/resolv.conf 2>/dev/null || true
 }
 
 sanitize_positive_int() {
@@ -206,13 +262,23 @@ set_session_geometry() {
 }
 
 xrandr_mode_name() {
-  printf '%sx%s_%s\n' "${WIDTH}" "${HEIGHT}" "${REFRESH_RATE}"
+  local generated
+
+  generated="$(
+    cvt "${WIDTH}" "${HEIGHT}" "${REFRESH_RATE}" 2>/dev/null \
+      | awk '/Modeline/ { gsub(/"/, "", $2); print $2; exit }'
+  )"
+  if [ -n "${generated}" ]; then
+    printf '%s\n' "${generated}"
+  else
+    printf '%sx%s_%s\n' "${WIDTH}" "${HEIGHT}" "${REFRESH_RATE}"
+  fi
 }
 
 xrandr_monitor_exists() {
   local name="$1"
 
-  DISPLAY="${DISPLAY_NAME}" xrandr --listmonitors 2>/dev/null \
+  DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --listmonitors 2>/dev/null \
     | awk -v name="${name}" '
         NR > 1 {
           monitor = $2
@@ -225,11 +291,15 @@ xrandr_monitor_exists() {
       '
 }
 
+x_display_available() {
+  DISPLAY="${DISPLAY_NAME}" timeout 3s xdpyinfo >/dev/null 2>&1
+}
+
 delete_xrandr_monitor() {
   local name="$1"
 
   if xrandr_monitor_exists "${name}"; then
-    DISPLAY="${DISPLAY_NAME}" xrandr --delmonitor "${name}" \
+    DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --delmonitor "${name}" \
       >>"${LOG_DIR}/xrandr.log" 2>&1 || true
   fi
 }
@@ -239,6 +309,7 @@ reset_session_vars() {
   XWAYLAND_PID=""
   WESTON_PID=""
   PLASMA_PID=""
+  NETWORK_STATUS_PID=""
   INPUT_BRIDGE_PID=""
   WIREPLUMBER_PID=""
   PIPEWIRE_PULSE_PID=""
@@ -276,6 +347,7 @@ write_session_state() {
     printf 'XWAYLAND_PID=%q\n' "${XWAYLAND_PID:-}"
     printf 'WESTON_PID=%q\n' "${WESTON_PID:-}"
     printf 'PLASMA_PID=%q\n' "${PLASMA_PID:-}"
+    printf 'NETWORK_STATUS_PID=%q\n' "${NETWORK_STATUS_PID:-}"
     printf 'INPUT_BRIDGE_PID=%q\n' "${INPUT_BRIDGE_PID:-}"
     printf 'WIREPLUMBER_PID=%q\n' "${WIREPLUMBER_PID:-}"
     printf 'PIPEWIRE_PULSE_PID=%q\n' "${PIPEWIRE_PULSE_PID:-}"
@@ -776,6 +848,8 @@ export KDE_FULL_SESSION=true
 export KWIN_COMPOSE=N
 export QT_QPA_PLATFORM=xcb
 export MOZ_ENABLE_WAYLAND=0
+export GIO_USE_NETWORK_MONITOR=base
+export RES_OPTIONS="timeout:1 attempts:2 rotate single-request-reopen"
 export SDL_VIDEODRIVER=x11
 export LIBGL_DRI3_ENABLE=1
 export PULSE_SERVER=unix:${RUNTIME_DIR}/pulse/native
@@ -787,7 +861,7 @@ EOF
 }
 
 active_xrandr_output() {
-  DISPLAY="${DISPLAY_NAME}" xrandr --query 2>/dev/null \
+  DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --query 2>/dev/null \
     | awk '/ connected/ { print $1; exit }'
 }
 
@@ -848,7 +922,7 @@ apply_xrandr_dpi() {
   local dpi
 
   dpi="$(scale_to_dpi "${SCALE}")"
-  DISPLAY="${DISPLAY_NAME}" xrandr --dpi "${dpi}" \
+  DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --dpi "${dpi}" \
     >>"${LOG_DIR}/xrandr.log" 2>&1 || true
 }
 
@@ -860,13 +934,13 @@ apply_desktop_scale_runtime() {
 
   output="$(active_xrandr_output || true)"
   if [ -n "${output}" ] && [ "${output}" != "none" ]; then
-    run_as_desktop_user kscreen-doctor "output.${output}.scale.${SCALE}" \
+    run_as_desktop_user timeout 2s kscreen-doctor "output.${output}.scale.${SCALE}" \
       >"${LOG_DIR}/scale.log" 2>&1 || true
   fi
 
-  run_as_desktop_user qdbus6 org.kde.KWin /KWin reconfigure \
+  run_as_desktop_user timeout 2s qdbus6 org.kde.KWin /KWin reconfigure \
     >>"${LOG_DIR}/scale.log" 2>&1 || true
-  run_as_desktop_user qdbus6 org.kde.KWin /Compositor suspend \
+  run_as_desktop_user timeout 2s qdbus6 org.kde.KWin /Compositor suspend \
     >>"${LOG_DIR}/scale.log" 2>&1 || true
 }
 
@@ -894,7 +968,7 @@ EOF
 )"
 
   if output="$(
-    run_as_desktop_user qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "${script}" 2>&1
+    run_as_desktop_user timeout 2s qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "${script}" 2>&1
   )"; then
     printf '%s\n' "${output}" >"${LOG_DIR}/disconnect-panel.log"
   else
@@ -967,9 +1041,9 @@ print("arch-sunshine-panel-launchers-set=" + changed);
 EOF
 )"
 
-  for _ in $(seq 1 50); do
+  for _ in $(seq 1 5); do
     if output="$(
-      run_as_desktop_user qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "${script}" 2>&1
+        run_as_desktop_user timeout 2s qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "${script}" 2>&1
     )"; then
       printf '%s\n' "${output}" >"${LOG_DIR}/panel-launchers.log"
       if printf '%s\n' "${output}" | grep -q 'arch-sunshine-panel-launchers-set=[1-9]'; then
@@ -1094,24 +1168,24 @@ configure_xrandr_monitor() {
   height_mm=$((HEIGHT * 254 / 960))
   output=none
 
-  DISPLAY="${DISPLAY_NAME}" xrandr --fb "${WIDTH}x${HEIGHT}" \
+  DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --fb "${WIDTH}x${HEIGHT}" \
     >"${LOG_DIR}/xrandr.log" 2>&1 || true
 
   if [ "${ACTIVE_DISPLAY_DRIVER}" = "modesetting" ]; then
-    DISPLAY="${DISPLAY_NAME}" xrandr --newmode "${mode_name}" ${mode_args} \
+    DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --newmode "${mode_name}" ${mode_args} \
       >>"${LOG_DIR}/xrandr.log" 2>&1 || true
-    DISPLAY="${DISPLAY_NAME}" xrandr --addmode "${OUTPUT_NAME}" "${mode_name}" \
+    DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --addmode "${OUTPUT_NAME}" "${mode_name}" \
       >>"${LOG_DIR}/xrandr.log" 2>&1 || true
-    DISPLAY="${DISPLAY_NAME}" xrandr --output "${OUTPUT_NAME}" --mode "${mode_name}" --rate "${REFRESH_RATE}" --primary \
+    DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --output "${OUTPUT_NAME}" --mode "${mode_name}" --rate "${REFRESH_RATE}" --primary \
       >>"${LOG_DIR}/xrandr.log" 2>&1 || true
     output="${OUTPUT_NAME}"
   elif [ "${ACTIVE_DISPLAY_DRIVER}" = "xwayland" ]; then
     output="$(
-      DISPLAY="${DISPLAY_NAME}" xrandr --query 2>/dev/null \
+      DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --query 2>/dev/null \
         | awk '/ connected/ { print $1; exit }'
     )"
     if [ -n "${output}" ]; then
-      DISPLAY="${DISPLAY_NAME}" xrandr --output "${output}" --mode "${WIDTH}x${HEIGHT}" --rate "${REFRESH_RATE}" --primary \
+      DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --output "${output}" --mode "${WIDTH}x${HEIGHT}" --rate "${REFRESH_RATE}" --primary \
         >>"${LOG_DIR}/xrandr.log" 2>&1 || true
     else
       output=none
@@ -1127,7 +1201,7 @@ configure_xrandr_monitor() {
   if [ "${monitor_name}" != "ArchSunshine" ]; then
     delete_xrandr_monitor "${monitor_name}"
   fi
-  DISPLAY="${DISPLAY_NAME}" xrandr --setmonitor "${monitor_name}" "${WIDTH}/${width_mm}x${HEIGHT}/${height_mm}+0+0" "${output}" \
+  DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --setmonitor "${monitor_name}" "${WIDTH}/${width_mm}x${HEIGHT}/${height_mm}+0+0" "${output}" \
     >>"${LOG_DIR}/xrandr.log" 2>&1 || true
   apply_xrandr_dpi
 }
@@ -1149,7 +1223,7 @@ launch_xorg_process() {
     if ! kill -0 "${XORG_PID}" 2>/dev/null; then
       return 1
     fi
-    if DISPLAY="${DISPLAY_NAME}" xdpyinfo >/dev/null 2>&1; then
+    if x_display_available; then
       configure_xrandr_monitor
       return 0
     fi
@@ -1207,7 +1281,7 @@ launch_xwayland_process() {
     if ! kill -0 "${XWAYLAND_PID}" 2>/dev/null; then
       return 1
     fi
-    if DISPLAY="${DISPLAY_NAME}" xdpyinfo >/dev/null 2>&1; then
+    if x_display_available; then
       configure_xrandr_monitor
       DISPLAY="${DISPLAY_NAME}" xset s off -dpms >/dev/null 2>&1 || true
       return 0
@@ -1249,16 +1323,26 @@ stop_xwayland_process() {
 }
 
 launch_plasma_process() {
+  local fallback_started=0
+
   run_as_desktop_user startplasma-x11 \
     >"${LOG_DIR}/plasma.log" 2>&1 &
   PLASMA_PID=$!
 
-  for _ in $(seq 1 160); do
+  for _ in $(seq 1 600); do
     if DISPLAY="${DISPLAY_NAME}" pgrep -u "${DESKTOP_UID}" -x plasmashell >/dev/null 2>&1; then
       return 0
     fi
+    if [ "${fallback_started}" -eq 0 ] \
+      && DISPLAY="${DISPLAY_NAME}" pgrep -u "${DESKTOP_UID}" -x kwin_x11 >/dev/null 2>&1; then
+      printf '%s\n' "plasmashell did not start automatically; starting fallback shell." \
+        >>"${LOG_DIR}/plasma.log"
+      run_as_desktop_user plasmashell --replace \
+        >>"${LOG_DIR}/plasma.log" 2>&1 &
+      fallback_started=1
+    fi
     if ! kill -0 "${PLASMA_PID}" 2>/dev/null; then
-      return 1
+      [ "${fallback_started}" -eq 1 ] || return 1
     fi
     sleep 0.1
   done
@@ -1285,6 +1369,10 @@ stop_display_processes() {
 
 start_system_bus() {
   mkdir -p /run/dbus
+  if system_bus_ready; then
+    return 0
+  fi
+
   rm -f /run/dbus/system_bus_socket /run/dbus/pid
 
   dbus-daemon --system --nofork --nopidfile \
@@ -1296,6 +1384,43 @@ start_system_bus() {
       return 0
     fi
     if ! kill -0 "${SYSTEM_DBUS_PID}" 2>/dev/null; then
+      return 1
+    fi
+    sleep 0.1
+  done
+
+  return 1
+}
+
+system_bus_ready() {
+  [ -S /run/dbus/system_bus_socket ] || return 1
+  dbus-send --system --print-reply \
+    --dest=org.freedesktop.DBus \
+    /org/freedesktop/DBus \
+    org.freedesktop.DBus.ListNames >/dev/null 2>&1
+}
+
+network_status_service_ready() {
+  dbus-send --system --print-reply \
+    --dest=org.freedesktop.DBus \
+    /org/freedesktop/DBus \
+    org.freedesktop.DBus.GetNameOwner \
+    string:org.freedesktop.NetworkManager >/dev/null 2>&1
+}
+
+start_network_status() {
+  if network_status_service_ready; then
+    return 0
+  fi
+
+  arch-sunshine-network-status >"${LOG_DIR}/network-status.log" 2>&1 &
+  NETWORK_STATUS_PID=$!
+
+  for _ in $(seq 1 50); do
+    if network_status_service_ready; then
+      return 0
+    fi
+    if ! kill -0 "${NETWORK_STATUS_PID}" 2>/dev/null; then
       return 1
     fi
     sleep 0.1
@@ -1464,7 +1589,6 @@ start_desktop_services() {
   if [ "${ACTIVE_DISPLAY_DRIVER}" != "xwayland" ]; then
     start_input_bridge || return 1
   fi
-  start_system_bus || return 1
   start_session_bus || return 1
   start_pipewire || return 1
 
@@ -1517,8 +1641,7 @@ session_has_live_process() {
     "${PIPEWIRE_PID:-}" \
     "${PIPEWIRE_PULSE_PID:-}" \
     "${WIREPLUMBER_PID:-}" \
-    "${SESSION_DBUS_PID:-}" \
-    "${SYSTEM_DBUS_PID:-}"; do
+    "${SESSION_DBUS_PID:-}"; do
     if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
       return 0
     fi
@@ -1532,7 +1655,7 @@ capture_display_live() {
 
   for pid in "${XORG_PID:-}" "${XWAYLAND_PID:-}" "${WESTON_PID:-}"; do
     if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
-      DISPLAY="${DISPLAY_NAME}" xdpyinfo >/dev/null 2>&1 && return 0
+      x_display_available && return 0
     fi
   done
 
@@ -1548,8 +1671,7 @@ desktop_session_live() {
     "${PIPEWIRE_PID:-}" \
     "${PIPEWIRE_PULSE_PID:-}" \
     "${WIREPLUMBER_PID:-}" \
-    "${SESSION_DBUS_PID:-}" \
-    "${SYSTEM_DBUS_PID:-}"; do
+    "${SESSION_DBUS_PID:-}"; do
     if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
       return 0
     fi
@@ -1566,8 +1688,10 @@ x_display_size_matches() {
 }
 
 current_x_display_size() {
-  DISPLAY="${DISPLAY_NAME}" xdpyinfo 2>/dev/null \
-    | awk '/dimensions:/ { print $2; exit }'
+  local output
+
+  output="$(DISPLAY="${DISPLAY_NAME}" timeout 3s xdpyinfo 2>/dev/null || true)"
+  printf '%s\n' "${output}" | awk '/dimensions:/ { print $2; exit }'
 }
 
 stop_desktop_user_processes() {
@@ -1614,16 +1738,21 @@ stop_desktop_services() {
   [ -n "${PIPEWIRE_PULSE_PID:-}" ] && terminate_pid "${PIPEWIRE_PULSE_PID}"
   [ -n "${PIPEWIRE_PID:-}" ] && terminate_pid "${PIPEWIRE_PID}"
   [ -n "${SESSION_DBUS_PID:-}" ] && terminate_pid "${SESSION_DBUS_PID}"
-  [ -n "${SYSTEM_DBUS_PID:-}" ] && terminate_pid "${SYSTEM_DBUS_PID}"
 
   WIREPLUMBER_PID=""
   PIPEWIRE_PULSE_PID=""
   PIPEWIRE_PID=""
   SESSION_DBUS_PID=""
-  SYSTEM_DBUS_PID=""
   DESKTOP_ACTIVE=0
 
   rm -f "${RUNTIME_DIR}/pipewire-0" "${RUNTIME_DIR}/pulse/native" "${RUNTIME_DIR}/bus"
+}
+
+stop_base_services() {
+  [ -n "${NETWORK_STATUS_PID:-}" ] && terminate_pid "${NETWORK_STATUS_PID}"
+  [ -n "${SYSTEM_DBUS_PID:-}" ] && terminate_pid "${SYSTEM_DBUS_PID}"
+  NETWORK_STATUS_PID=""
+  SYSTEM_DBUS_PID=""
 }
 
 stop_desktop_runtime() {
@@ -1650,6 +1779,8 @@ session_start_locked() {
 
   set_session_geometry "${requested_width}" "${requested_height}" "${requested_refresh}" "${requested_scale}"
   prepare_session_runtime
+  start_system_bus || return 1
+  start_network_status || log "Network status service failed; Plasma may show disconnected."
 
   if capture_display_live; then
     configure_xrandr_monitor
@@ -1788,6 +1919,7 @@ shutdown() {
   [ -n "${SUNSHINE_PID:-}" ] && terminate_pid "${SUNSHINE_PID}"
   load_session_state >/dev/null 2>&1 || reset_session_vars
   stop_desktop_runtime
+  stop_base_services
   if mountpoint -q "${HOME_DIR}"; then
     umount "${HOME_DIR}" 2>/dev/null || true
   fi
@@ -2005,14 +2137,21 @@ main() {
     exit 1
   }
   ensure_machine_id
+  configure_network_resolution
   lock_root_filesystem || {
     log "Failed to remount the container root filesystem read-only."
     exit 1
   }
+  mount_runtime_resolv_conf || log "Failed to mount runtime /etc/resolv.conf; DNS may not work."
   setup_user_data
   seed_web_credentials
   set_session_geometry "${DEFAULT_WIDTH}" "${DEFAULT_HEIGHT}" "${DEFAULT_REFRESH_RATE}"
   prepare_session_runtime
+  start_system_bus || {
+    log "System D-Bus failed to start"
+    exit 1
+  }
+  start_network_status || log "Network status service failed; Plasma may show disconnected."
   start_capture_display || {
     log "X11 capture display failed to start"
     log "Xorg logs: ${LOG_DIR}/xorg.log"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STEAM_REAL=/usr/bin/steam
+STEAM_REAL="${ARCH_SUNSHINE_STEAM_REAL:-/usr/bin/steam}"
 STEAM_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/Steam"
 STEAM_BOOTSTRAP_TAR=/usr/share/arch-sunshine/steam/bootstraplinux_ubuntu12_32.tar.xz
 STEAM_DEV_CFG="${HOME}/.steam/steam/steam_dev.cfg"
@@ -50,12 +50,45 @@ configure_steam_defaults() {
   fi
 }
 
+clear_steam_offline_state() {
+  local file
+
+  for file in \
+    "${STEAM_DIR}/config/loginusers.vdf" \
+    "${STEAM_DIR}/config/config.vdf" \
+    "${STEAM_DIR}/registry.vdf" \
+    "${HOME}/.steam/registry.vdf"; do
+    [ -f "${file}" ] || continue
+    sed -i -E \
+      -e 's/"WantsOfflineMode"[[:space:]]+"1"/"WantsOfflineMode"\t\t"0"/g' \
+      -e 's/"SkipOfflineModeWarning"[[:space:]]+"1"/"SkipOfflineModeWarning"\t\t"0"/g' \
+      -e 's/"Offline"[[:space:]]+"1"/"Offline"\t\t"0"/g' \
+      -e 's/"ForceOfflineMode"[[:space:]]+"1"/"ForceOfflineMode"\t\t"0"/g' \
+      "${file}"
+  done
+}
+
 export STEAM_RUNTIME=1
 export SRT_URLOPEN_PREFER_STEAM=1
 export STEAM_DISABLE_AUDIO_DEVICE_SWITCHING=1
+export GIO_USE_NETWORK_MONITOR=base
+export RES_OPTIONS="timeout:1 attempts:2 rotate single-request-reopen"
 
 ensure_steam_bootstrap
 ensure_steam_links
 configure_steam_defaults
+clear_steam_offline_state
 
-exec "${STEAM_REAL}" "$@"
+steam_args=("$@")
+has_tcp=0
+for arg in "${steam_args[@]}"; do
+  if [ "${arg}" = "-tcp" ]; then
+    has_tcp=1
+    break
+  fi
+done
+if [ "${has_tcp}" -eq 0 ]; then
+  steam_args=(-tcp "${steam_args[@]}")
+fi
+
+exec "${STEAM_REAL}" "${steam_args[@]}"

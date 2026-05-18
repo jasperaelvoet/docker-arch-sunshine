@@ -10,6 +10,8 @@
     "KDE_SESSION_VERSION": "6",
     "KDE_FULL_SESSION": "true",
     "QT_QPA_PLATFORM": "xcb",
+    "GIO_USE_NETWORK_MONITOR": "base",
+    "RES_OPTIONS": "timeout:1 attempts:2 rotate single-request-reopen",
     "LIBGL_DRI3_ENABLE": "1",
     "PULSE_SERVER": "unix:/run/user/1000/pulse/native",
     "MOZ_ENABLE_WAYLAND": "0",

@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+import signal
+import socket
+import time
+
+import dbus
+import dbus.exceptions
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+
+DBUS_PROPERTIES = "org.freedesktop.DBus.Properties"
+DBUS_OBJECT_MANAGER = "org.freedesktop.DBus.ObjectManager"
+
+NM = "org.freedesktop.NetworkManager"
+NM_SETTINGS = "org.freedesktop.NetworkManager.Settings"
+NM_SETTINGS_CONNECTION = "org.freedesktop.NetworkManager.Settings.Connection"
+NM_DEVICE = "org.freedesktop.NetworkManager.Device"
+NM_DEVICE_WIRED = "org.freedesktop.NetworkManager.Device.Wired"
+NM_ACTIVE = "org.freedesktop.NetworkManager.Connection.Active"
+NM_IP4 = "org.freedesktop.NetworkManager.IP4Config"
+
+ROOT_PATH = "/org/freedesktop"
+NM_PATH = "/org/freedesktop/NetworkManager"
+SETTINGS_PATH = "/org/freedesktop/NetworkManager/Settings"
+CONNECTION_PATH = "/org/freedesktop/NetworkManager/Settings/0"
+DEVICE_PATH = "/org/freedesktop/NetworkManager/Devices/0"
+ACTIVE_PATH = "/org/freedesktop/NetworkManager/ActiveConnection/0"
+IP4_PATH = "/org/freedesktop/NetworkManager/IP4Config/0"
+
+UUID = "29b7ed8b-4105-4466-9b3f-2b1f5c2c7a41"
+CONNECTION_ID = "Arch Sunshine Ethernet"
+DEVICE_IFACE = "archsun0"
+MAC_ADDRESS = "02:42:AC:53:00:01"
+
+NM_STATE_CONNECTED_GLOBAL = 70
+NM_CONNECTIVITY_FULL = 4
+NM_DEVICE_TYPE_ETHERNET = 1
+NM_DEVICE_STATE_ACTIVATED = 100
+NM_DEVICE_STATE_REASON_NONE = 0
+NM_ACTIVE_CONNECTION_STATE_ACTIVATED = 2
+NM_METERED_NO = 2
+
+
+def opath(path):
+    return dbus.ObjectPath(path)
+
+
+def opath_array(paths):
+    return dbus.Array([opath(path) for path in paths], signature="o")
+
+
+def string_array(values=None):
+    return dbus.Array(values or [], signature="s")
+
+
+def uint_array(values=None):
+    return dbus.Array(values or [], signature="u")
+
+
+def string_variant_dict(values=None):
+    return dbus.Dictionary(values or {}, signature="sv")
+
+
+def property_map(values):
+    return dbus.Dictionary(values, signature="sv")
+
+
+def object_properties_map(values):
+    return dbus.Dictionary(values, signature="sa{sv}")
+
+
+def invalid_args(message):
+    return dbus.exceptions.DBusException(
+        message,
+        name="org.freedesktop.DBus.Error.InvalidArgs",
+    )
+
+
+class NetworkStatusObject(dbus.service.Object):
+    def __init__(self, bus_name, object_path, properties):
+        super().__init__(bus_name, object_path)
+        self.object_path = object_path
+        self.properties = properties
+
+    @dbus.service.method(DBUS_PROPERTIES, in_signature="ss", out_signature="v")
+    def Get(self, interface_name, property_name):
+        if interface_name not in self.properties:
+            raise invalid_args(f"Unknown interface {interface_name}")
+        if property_name not in self.properties[interface_name]:
+            raise invalid_args(f"Unknown property {property_name}")
+        return self.properties[interface_name][property_name]
+
+    @dbus.service.method(DBUS_PROPERTIES, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface_name):
+        if interface_name not in self.properties:
+            return property_map({})
+        return property_map(self.properties[interface_name])
+
+    @dbus.service.method(DBUS_PROPERTIES, in_signature="ssv")
+    def Set(self, interface_name, property_name, value):
+        if interface_name in self.properties and property_name in self.properties[interface_name]:
+            self.properties[interface_name][property_name] = value
+            self.PropertiesChanged(
+                interface_name,
+                property_map({property_name: value}),
+                string_array(),
+            )
+            return
+        raise invalid_args(f"Unknown property {interface_name}.{property_name}")
+
+    @dbus.service.signal(DBUS_PROPERTIES, signature="sa{sv}as")
+    def PropertiesChanged(self, interface_name, changed_properties, invalidated_properties):
+        pass
+
+
+class ObjectManager(dbus.service.Object):
+    def __init__(self, bus_name, object_path, registry):
+        super().__init__(bus_name, object_path)
+        self.registry = registry
+
+    @dbus.service.method(DBUS_OBJECT_MANAGER, out_signature="a{oa{sa{sv}}}")
+    def GetManagedObjects(self):
+        managed = dbus.Dictionary(signature="oa{sa{sv}}")
+        for path, obj in self.registry.items():
+            managed[opath(path)] = object_properties_map(
+                {
+                    interface: property_map(properties)
+                    for interface, properties in obj.properties.items()
+                }
+            )
+        return managed
+
+    @dbus.service.signal(DBUS_OBJECT_MANAGER, signature="oa{sa{sv}}")
+    def InterfacesAdded(self, object_path, interfaces):
+        pass
+
+    @dbus.service.signal(DBUS_OBJECT_MANAGER, signature="oas")
+    def InterfacesRemoved(self, object_path, interfaces):
+        pass
+
+
+class NetworkManager(NetworkStatusObject):
+    @dbus.service.method(NM, out_signature="ao")
+    def GetDevices(self):
+        return opath_array([DEVICE_PATH])
+
+    @dbus.service.method(NM, out_signature="ao")
+    def GetAllDevices(self):
+        return opath_array([DEVICE_PATH])
+
+    @dbus.service.method(NM, in_signature="s", out_signature="o")
+    def GetDeviceByIpIface(self, iface):
+        if iface in (DEVICE_IFACE, ""):
+            return opath(DEVICE_PATH)
+        raise dbus.exceptions.DBusException(
+            f"No device with interface {iface}",
+            name="org.freedesktop.NetworkManager.UnknownDevice",
+        )
+
+    @dbus.service.method(NM, in_signature="ooo", out_signature="o")
+    def ActivateConnection(self, _connection, _device, _specific_object):
+        return opath(ACTIVE_PATH)
+
+    @dbus.service.method(NM, in_signature="a{sa{sv}}oo", out_signature="oo")
+    def AddAndActivateConnection(self, _connection, _device, _specific_object):
+        return opath(CONNECTION_PATH), opath(ACTIVE_PATH)
+
+    @dbus.service.method(NM, in_signature="a{sa{sv}}ooa{sv}", out_signature="ooa{sv}")
+    def AddAndActivateConnection2(self, _connection, _device, _specific_object, _options):
+        return opath(CONNECTION_PATH), opath(ACTIVE_PATH), string_variant_dict()
+
+    @dbus.service.method(NM, in_signature="o")
+    def DeactivateConnection(self, _active_connection):
+        return
+
+    @dbus.service.method(NM, in_signature="b")
+    def Sleep(self, _sleep):
+        return
+
+    @dbus.service.method(NM, in_signature="b")
+    def Enable(self, enabled):
+        self.properties[NM]["NetworkingEnabled"] = dbus.Boolean(enabled)
+        self.PropertiesChanged(
+            NM,
+            property_map({"NetworkingEnabled": dbus.Boolean(enabled)}),
+            string_array(),
+        )
+
+    @dbus.service.method(NM, out_signature="a{ss}")
+    def GetPermissions(self):
+        return dbus.Dictionary(
+            {
+                "org.freedesktop.NetworkManager.enable-disable-network": "yes",
+                "org.freedesktop.NetworkManager.network-control": "yes",
+                "org.freedesktop.NetworkManager.settings.modify.system": "no",
+                "org.freedesktop.NetworkManager.settings.modify.own": "no",
+                "org.freedesktop.NetworkManager.settings.modify.hostname": "no",
+            },
+            signature="ss",
+        )
+
+    @dbus.service.method(NM, out_signature="u")
+    def CheckConnectivity(self):
+        return dbus.UInt32(NM_CONNECTIVITY_FULL)
+
+    @dbus.service.method(NM, out_signature="u")
+    def state(self):
+        return dbus.UInt32(NM_STATE_CONNECTED_GLOBAL)
+
+    @dbus.service.method(NM, in_signature="ss")
+    def SetLogging(self, _level, _domains):
+        return
+
+    @dbus.service.method(NM, out_signature="ss")
+    def GetLogging(self):
+        return "ERR", ""
+
+    @dbus.service.signal(NM, signature="u")
+    def StateChanged(self, state):
+        pass
+
+
+class Settings(NetworkStatusObject):
+    @dbus.service.method(NM_SETTINGS, out_signature="ao")
+    def ListConnections(self):
+        return opath_array([CONNECTION_PATH])
+
+    @dbus.service.method(NM_SETTINGS, in_signature="s", out_signature="o")
+    def GetConnectionByUuid(self, uuid):
+        if uuid == UUID:
+            return opath(CONNECTION_PATH)
+        raise dbus.exceptions.DBusException(
+            f"No connection with UUID {uuid}",
+            name="org.freedesktop.NetworkManager.Settings.InvalidConnection",
+        )
+
+    @dbus.service.method(NM_SETTINGS, in_signature="a{sa{sv}}", out_signature="o")
+    def AddConnection(self, _connection):
+        return opath(CONNECTION_PATH)
+
+    @dbus.service.method(NM_SETTINGS, in_signature="a{sa{sv}}", out_signature="o")
+    def AddConnectionUnsaved(self, _connection):
+        return opath(CONNECTION_PATH)
+
+    @dbus.service.method(NM_SETTINGS, in_signature="a{sa{sv}}ua{sv}", out_signature="oa{sv}")
+    def AddConnection2(self, _settings, _flags, _args):
+        return opath(CONNECTION_PATH), string_variant_dict()
+
+    @dbus.service.method(NM_SETTINGS, in_signature="as", out_signature="bas")
+    def LoadConnections(self, _filenames):
+        return dbus.Boolean(True), string_array()
+
+    @dbus.service.method(NM_SETTINGS, out_signature="b")
+    def ReloadConnections(self):
+        return dbus.Boolean(True)
+
+    @dbus.service.method(NM_SETTINGS, in_signature="s")
+    def SaveHostname(self, _hostname):
+        return
+
+
+class SettingsConnection(NetworkStatusObject):
+    @dbus.service.method(NM_SETTINGS_CONNECTION, out_signature="a{sa{sv}}")
+    def GetSettings(self):
+        return dbus.Dictionary(
+            {
+                "connection": property_map(
+                    {
+                        "id": dbus.String(CONNECTION_ID),
+                        "uuid": dbus.String(UUID),
+                        "type": dbus.String("802-3-ethernet"),
+                        "interface-name": dbus.String(DEVICE_IFACE),
+                        "autoconnect": dbus.Boolean(True),
+                        "timestamp": dbus.UInt64(int(time.time())),
+                    }
+                ),
+                "802-3-ethernet": property_map(
+                    {
+                        "auto-negotiate": dbus.Boolean(False),
+                        "mac-address-blacklist": string_array(),
+                    }
+                ),
+                "ipv4": property_map({"method": dbus.String("auto")}),
+                "ipv6": property_map({"method": dbus.String("ignore")}),
+                "proxy": property_map({}),
+            },
+            signature="sa{sv}",
+        )
+
+    @dbus.service.method(NM_SETTINGS_CONNECTION, in_signature="s", out_signature="a{sa{sv}}")
+    def GetSecrets(self, _setting_name):
+        return dbus.Dictionary({}, signature="sa{sv}")
+
+    @dbus.service.method(NM_SETTINGS_CONNECTION, in_signature="a{sa{sv}}")
+    def Update(self, _properties):
+        return
+
+    @dbus.service.method(NM_SETTINGS_CONNECTION, in_signature="a{sa{sv}}")
+    def UpdateUnsaved(self, _properties):
+        return
+
+    @dbus.service.method(NM_SETTINGS_CONNECTION)
+    def Delete(self):
+        return
+
+    @dbus.service.method(NM_SETTINGS_CONNECTION)
+    def ClearSecrets(self):
+        return
+
+    @dbus.service.method(NM_SETTINGS_CONNECTION)
+    def Save(self):
+        return
+
+    @dbus.service.method(NM_SETTINGS_CONNECTION, in_signature="a{sa{sv}}ua{sv}", out_signature="a{sv}")
+    def Update2(self, _settings, _flags, _args):
+        return string_variant_dict()
+
+
+def manager_properties():
+    active_connections = opath_array([ACTIVE_PATH])
+    devices = opath_array([DEVICE_PATH])
+    return {
+        NM: {
+            "Version": dbus.String("1.50.0"),
+            "VersionInfo": uint_array([dbus.UInt32((1 << 16) | (50 << 8))]),
+            "Capabilities": uint_array(),
+            "State": dbus.UInt32(NM_STATE_CONNECTED_GLOBAL),
+            "Startup": dbus.Boolean(False),
+            "NetworkingEnabled": dbus.Boolean(True),
+            "WirelessEnabled": dbus.Boolean(False),
+            "WirelessHardwareEnabled": dbus.Boolean(False),
+            "WwanEnabled": dbus.Boolean(False),
+            "WwanHardwareEnabled": dbus.Boolean(False),
+            "ActiveConnections": active_connections,
+            "PrimaryConnection": opath(ACTIVE_PATH),
+            "PrimaryConnectionType": dbus.String("802-3-ethernet"),
+            "ActivatingConnection": opath("/"),
+            "Devices": devices,
+            "AllDevices": devices,
+            "Connectivity": dbus.UInt32(NM_CONNECTIVITY_FULL),
+            "ConnectivityCheckAvailable": dbus.Boolean(False),
+            "ConnectivityCheckEnabled": dbus.Boolean(False),
+            "ConnectivityCheckUri": dbus.String(""),
+            "Metered": dbus.UInt32(NM_METERED_NO),
+            "GlobalDnsConfiguration": string_variant_dict(),
+        }
+    }
+
+
+def settings_properties():
+    return {
+        NM_SETTINGS: {
+            "Connections": opath_array([CONNECTION_PATH]),
+            "Hostname": dbus.String(socket.gethostname() or "arch-sunshine"),
+            "CanModify": dbus.Boolean(False),
+            "VersionId": dbus.UInt64(1),
+        }
+    }
+
+
+def settings_connection_properties():
+    return {
+        NM_SETTINGS_CONNECTION: {
+            "Unsaved": dbus.Boolean(False),
+            "Flags": dbus.UInt32(0),
+            "Filename": dbus.String(""),
+        }
+    }
+
+
+def device_properties():
+    return {
+        NM_DEVICE: {
+            "Udi": dbus.String("/sys/devices/virtual/net/" + DEVICE_IFACE),
+            "Path": dbus.String("/sys/devices/virtual/net/" + DEVICE_IFACE),
+            "Interface": dbus.String(DEVICE_IFACE),
+            "IpInterface": dbus.String(DEVICE_IFACE),
+            "Driver": dbus.String("arch-sunshine"),
+            "DriverVersion": dbus.String(""),
+            "FirmwareVersion": dbus.String(""),
+            "Capabilities": dbus.UInt32(1),
+            "Ip4Address": dbus.UInt32(0),
+            "State": dbus.UInt32(NM_DEVICE_STATE_ACTIVATED),
+            "StateReason": dbus.Struct(
+                (dbus.UInt32(NM_DEVICE_STATE_ACTIVATED), dbus.UInt32(NM_DEVICE_STATE_REASON_NONE)),
+                signature="uu",
+            ),
+            "ActiveConnection": opath(ACTIVE_PATH),
+            "Ip4Config": opath(IP4_PATH),
+            "Dhcp4Config": opath("/"),
+            "Ip6Config": opath("/"),
+            "Dhcp6Config": opath("/"),
+            "Managed": dbus.Boolean(True),
+            "Autoconnect": dbus.Boolean(True),
+            "FirmwareMissing": dbus.Boolean(False),
+            "NmPluginMissing": dbus.Boolean(False),
+            "DeviceType": dbus.UInt32(NM_DEVICE_TYPE_ETHERNET),
+            "AvailableConnections": opath_array([CONNECTION_PATH]),
+            "PhysicalPortId": dbus.String(""),
+            "Mtu": dbus.UInt32(1500),
+            "Metered": dbus.UInt32(NM_METERED_NO),
+            "LldpNeighbors": dbus.Array([], signature="a{sv}"),
+            "Real": dbus.Boolean(True),
+            "Ip4Connectivity": dbus.UInt32(NM_CONNECTIVITY_FULL),
+            "Ip6Connectivity": dbus.UInt32(0),
+            "InterfaceFlags": dbus.UInt32(3),
+            "HwAddress": dbus.String(MAC_ADDRESS),
+            "Ports": opath_array([]),
+        },
+        NM_DEVICE_WIRED: {
+            "HwAddress": dbus.String(MAC_ADDRESS),
+            "PermHwAddress": dbus.String(MAC_ADDRESS),
+            "Speed": dbus.UInt32(1000),
+            "S390Subchannels": string_array(),
+            "Carrier": dbus.Boolean(True),
+        },
+    }
+
+
+def active_connection_properties():
+    return {
+        NM_ACTIVE: {
+            "Connection": opath(CONNECTION_PATH),
+            "SpecificObject": opath("/"),
+            "Id": dbus.String(CONNECTION_ID),
+            "Uuid": dbus.String(UUID),
+            "Type": dbus.String("802-3-ethernet"),
+            "Devices": opath_array([DEVICE_PATH]),
+            "State": dbus.UInt32(NM_ACTIVE_CONNECTION_STATE_ACTIVATED),
+            "StateFlags": dbus.UInt32(0),
+            "Default": dbus.Boolean(True),
+            "Ip4Config": opath(IP4_PATH),
+            "Dhcp4Config": opath("/"),
+            "Default6": dbus.Boolean(False),
+            "Ip6Config": opath("/"),
+            "Dhcp6Config": opath("/"),
+            "Vpn": dbus.Boolean(False),
+            "Controller": opath("/"),
+            "Master": opath("/"),
+        }
+    }
+
+
+def ip4_properties():
+    return {
+        NM_IP4: {
+            "Addresses": dbus.Array([], signature="au"),
+            "AddressData": dbus.Array(
+                [
+                    property_map(
+                        {
+                            "address": dbus.String("192.0.2.2"),
+                            "prefix": dbus.UInt32(24),
+                        }
+                    )
+                ],
+                signature="a{sv}",
+            ),
+            "Gateway": dbus.String("192.0.2.1"),
+            "Routes": dbus.Array([], signature="au"),
+            "RouteData": dbus.Array(
+                [
+                    property_map(
+                        {
+                            "dest": dbus.String("0.0.0.0"),
+                            "prefix": dbus.UInt32(0),
+                            "next-hop": dbus.String("192.0.2.1"),
+                            "metric": dbus.UInt32(100),
+                        }
+                    )
+                ],
+                signature="a{sv}",
+            ),
+            "Nameservers": uint_array(),
+            "NameserverData": dbus.Array([], signature="a{sv}"),
+            "Domains": string_array(),
+            "Searches": string_array(),
+            "DnsOptions": string_array(),
+            "DnsPriority": dbus.Int32(0),
+            "WinsServers": uint_array(),
+            "WinsServerData": string_array(),
+        }
+    }
+
+
+def main():
+    DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    bus_name = dbus.service.BusName(NM, bus=bus, do_not_queue=True)
+    registry = {}
+
+    ObjectManager(bus_name, ROOT_PATH, registry)
+
+    objects = [
+        NetworkManager(bus_name, NM_PATH, manager_properties()),
+        Settings(bus_name, SETTINGS_PATH, settings_properties()),
+        SettingsConnection(bus_name, CONNECTION_PATH, settings_connection_properties()),
+        NetworkStatusObject(bus_name, DEVICE_PATH, device_properties()),
+        NetworkStatusObject(bus_name, ACTIVE_PATH, active_connection_properties()),
+        NetworkStatusObject(bus_name, IP4_PATH, ip4_properties()),
+    ]
+
+    for obj in objects:
+        registry[obj.object_path] = obj
+
+    loop = GLib.MainLoop()
+
+    def stop(_signum, _frame):
+        loop.quit()
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    print("Arch Sunshine network status service ready", flush=True)
+    loop.run()
+
+
+if __name__ == "__main__":
+    main()

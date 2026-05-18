@@ -1,0 +1,23 @@
+{
+  "policies": {
+    "DisableDNSOverHTTPS": true,
+    "Preferences": {
+      "network.dns.disableIPv6": {
+        "Value": true,
+        "Status": "locked"
+      },
+      "network.dns.native_https_query": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "network.proxy.type": {
+        "Value": 0,
+        "Status": "locked"
+      },
+      "network.trr.mode": {
+        "Value": 5,
+        "Status": "locked"
+      }
+    }
+  }
+}

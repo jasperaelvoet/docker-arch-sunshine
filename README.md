@@ -33,6 +33,14 @@ This builds the image, starts the container, and attaches to the terminal contro
 UI. Pair from Moonlight, then press `p` in the control UI to enter the pairing
 PIN.
 
+## Published Image
+
+Every push to `main` publishes the container to GitHub Container Registry:
+
+```sh
+docker pull ghcr.io/jasperaelvoet/docker-arch-sunshine:latest
+```
+
 ## Commands
 
 ```sh

@@ -56,6 +56,8 @@ RUN printf '\nDisableSandbox\n\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n
       procps-ng \
       plasma-nm \
       plasma-pa \
+      python-dbus \
+      python-gobject \
       qt6-multimedia-ffmpeg \
       seatd \
       shared-mime-info \
@@ -129,12 +131,18 @@ COPY --chmod=755 build/container/bin/arch-sunshine-steam /usr/local/bin/arch-sun
 COPY --chmod=755 build/container/bin/arch-sunshine-steamos-update /usr/local/bin/arch-sunshine-steamos-update
 COPY --chmod=755 build/container/bin/arch-sunshine /usr/local/bin/arch-sunshine
 COPY --chmod=755 build/container/bin/arch-sunshine-input-bridge /usr/local/bin/arch-sunshine-input-bridge
+COPY --chmod=755 build/container/bin/arch-sunshine-network-status /usr/local/bin/arch-sunshine-network-status
+COPY build/container/dbus/arch-sunshine-network-status.conf /usr/share/dbus-1/system.d/arch-sunshine-network-status.conf
+COPY build/container/firefox/policies.json /usr/lib/firefox/distribution/policies.json
 
 RUN install -d -m 1777 /var/lib/xkb \
     && mkdir -p /mnt/user_data \
     && chmod 1777 /tmp \
     && install -d -m 755 /usr/lib/arch-sunshine \
     && mv /usr/bin/pacman /usr/lib/arch-sunshine/pacman.real \
+    && (setcap cap_net_raw+ep /usr/bin/ping || chmod 4755 /usr/bin/ping) \
+    && sed -i -E 's/^hosts:.*/hosts: files mymachines myhostname dns resolve/' /etc/nsswitch.conf \
+    && printf 'precedence ::ffff:0:0/96  100\n' >> /etc/gai.conf \
     && ln -sf /usr/local/bin/arch-sunshine-pacman /usr/bin/pacman \
     && ln -sf /usr/local/bin/arch-sunshine-steam /usr/local/bin/steam \
     && ln -sf /usr/local/bin/arch-sunshine-steamos-update /usr/bin/steamos-update \
