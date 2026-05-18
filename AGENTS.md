@@ -48,7 +48,7 @@ Moonlight, KDE Plasma, Steam, and Firefox.
 
 Before handing off meaningful runtime changes, at minimum check:
 
-- `python3 -m py_compile build/container/bin/arch-sunshine build/container/bin/arch-sunshine-server build/container/bin/arch-sunshine-network-status`
+- `python3 -m py_compile build/container/bin/arch-sunshine build/container/bin/arch-sunshine-network-status`
 - `bash -n build/container/bin/arch-sunshine-pacman build/container/bin/arch-sunshine-steam build/container/bin/arch-sunshine-steamos-update build/container/bin/arch-sunshine-preseed-steam scripts/remote-sync scripts/remote-clean`
 - `python3 -m json.tool config/sunshine/pipelines.json >/dev/null`
 - `python3 -m json.tool config/sunshine/apps.json >/dev/null`
