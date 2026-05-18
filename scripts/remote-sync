@@ -36,6 +36,7 @@ sync_once() {
       --exclude '.vscode/' \
       --exclude 'mnt/' \
       --exclude 'data/' \
+      --exclude 'external/' \
       --exclude '*.log' \
       --exclude '__pycache__/' \
       --exclude '*.pyc' \
@@ -44,7 +45,7 @@ sync_once() {
     return
   fi
 
-  "${SSH}" "${REMOTE}" "cd '${REMOTE_DIR}' && rm -rf AGENTS.md Makefile README.md compose.yaml .dockerignore .gitattributes .gitignore build config scripts"
+  "${SSH}" "${REMOTE}" "cd '${REMOTE_DIR}' && rm -rf AGENTS.md Makefile README.md compose.yaml .dockerignore .gitattributes .gitignore build config docs external scripts"
   COPYFILE_DISABLE=1 tar \
     --exclude './.git' \
     --exclude './.github' \
@@ -53,6 +54,7 @@ sync_once() {
     --exclude './.vscode' \
     --exclude './mnt' \
     --exclude './data' \
+    --exclude './external' \
     --exclude './*.log' \
     --exclude './__pycache__' \
     --exclude './*.pyc' \
@@ -77,6 +79,7 @@ fingerprint() {
       -o -path './.vscode' \
       -o -path './mnt' \
       -o -path './data' \
+      -o -path './external' \
       -o -path './__pycache__' \) -prune \
     -o -type f \
       ! -name '.DS_Store' \

@@ -1,2212 +1,2304 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-USER_DATA=/mnt/user_data
-CONFIG_DIR="${USER_DATA}/etc/sunshine"
-STATE_DIR="${USER_DATA}/var/lib/sunshine"
-LOG_DIR="${USER_DATA}/var/log/arch-sunshine"
-DESKTOP_USER=sunshine
-DESKTOP_UID=1000
-DESKTOP_GID=1000
-PERSISTENT_HOME_DIR="${USER_DATA}/home/${DESKTOP_USER}"
-HOME_DIR="/home/${DESKTOP_USER}"
-RUNTIME_DIR="/run/user/${DESKTOP_UID}"
-DISPLAY_NUM="${SUNSHINE_DISPLAY_NUM:-99}"
-DISPLAY_NAME=":${DISPLAY_NUM}"
-WAYLAND_SOCKET="${SUNSHINE_WAYLAND_SOCKET:-arch-sunshine-wayland}"
-DISPLAY_DRIVER="${SUNSHINE_DISPLAY_DRIVER:-auto}"
-ACTIVE_DISPLAY_DRIVER="${DISPLAY_DRIVER}"
-CARD_NODE="${SUNSHINE_CARD_NODE:-/dev/dri/card0}"
-OUTPUT_NAME="${SUNSHINE_OUTPUT_NAME:-}"
-RENDER_NODE="${SUNSHINE_RENDER_NODE:-/dev/dri/renderD128}"
-DEFAULT_WIDTH="${SUNSHINE_WIDTH:-1920}"
-DEFAULT_HEIGHT="${SUNSHINE_HEIGHT:-1080}"
-DEFAULT_REFRESH_RATE="${SUNSHINE_FPS:-60}"
-DEFAULT_SCALE="${SUNSHINE_SCALE:-auto}"
-WIDTH="${DEFAULT_WIDTH}"
-HEIGHT="${DEFAULT_HEIGHT}"
-REFRESH_RATE="${DEFAULT_REFRESH_RATE}"
-SCALE=1
-XORG_CONFIG="${LOG_DIR}/xorg.conf"
-SESSION_RUNTIME_DIR=/run/arch-sunshine
-SESSION_STATE_FILE="${SESSION_RUNTIME_DIR}/session.env"
-SESSION_LOCK_DIR="${SESSION_RUNTIME_DIR}/session.lock.d"
-RUNTIME_RESOLV_CONF="${SESSION_RUNTIME_DIR}/resolv.conf"
-DISCONNECT_DESKTOP_FILE="${HOME_DIR}/.local/share/applications/arch-sunshine-disconnect.desktop"
-DISCONNECT_DESKTOP_ICON="${HOME_DIR}/Desktop/arch-sunshine-disconnect.desktop"
-DISCONNECT_PANEL_MARKER="${HOME_DIR}/.config/arch-sunshine-disconnect-panel-added"
-HOME_OWNERSHIP_MARKER="${PERSISTENT_HOME_DIR}/.config/arch-sunshine/ownership-v2"
-STEAM_BOOTSTRAP_TAR=/usr/share/arch-sunshine/steam/bootstraplinux_ubuntu12_32.tar.xz
-WEB_UI_USER=sunshine
-WEB_UI_PASS=sunshine
-DNS_SERVERS="${SUNSHINE_DNS_SERVERS:-1.1.1.1 8.8.8.8}"
-
-log() {
-  printf '%s\n' "$*"
-}
-
-run_as_desktop_user() {
-  local env_args=(
-    "HOME=${HOME_DIR}"
-    "USER=${DESKTOP_USER}"
-    "LOGNAME=${DESKTOP_USER}"
-    "LANG=en_US.UTF-8"
-    "LC_CTYPE=en_US.UTF-8"
-    "XDG_RUNTIME_DIR=${RUNTIME_DIR}"
-    "XDG_CONFIG_HOME=${HOME_DIR}/.config"
-    "XDG_DATA_HOME=${HOME_DIR}/.local/share"
-    "XDG_CURRENT_DESKTOP=KDE"
-    "XDG_MENU_PREFIX=plasma-"
-    "XDG_SESSION_DESKTOP=KDE"
-    "XDG_SESSION_TYPE=x11"
-    "XDG_DATA_DIRS=/usr/local/share:/usr/share"
-    "XDG_CONFIG_DIRS=/etc/xdg"
-    "DESKTOP_SESSION=plasma"
-    "KDE_SESSION_VERSION=6"
-    "KDE_FULL_SESSION=true"
-    "KWIN_COMPOSE=N"
-    "QT_QPA_PLATFORM=xcb"
-    "GIO_USE_NETWORK_MONITOR=base"
-    "RES_OPTIONS=timeout:1 attempts:2 rotate single-request-reopen"
-    "LIBGL_DRI3_ENABLE=1"
-    "PULSE_SERVER=unix:${RUNTIME_DIR}/pulse/native"
-    "SDL_VIDEODRIVER=x11"
-    "STEAM_RUNTIME=1"
-    "SRT_URLOPEN_PREFER_STEAM=1"
-    "STEAM_DISABLE_AUDIO_DEVICE_SWITCHING=1"
-    "DISPLAY=${DISPLAY_NAME}"
-  )
-
-  if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-    env_args+=("DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}")
-  fi
-
-  if [ -n "${SUNSHINE_VAAPI_DRIVER:-}" ]; then
-    env_args+=("LIBVA_DRIVER_NAME=${SUNSHINE_VAAPI_DRIVER}")
-  fi
-
-  runuser -u "${DESKTOP_USER}" -- env "${env_args[@]}" "${@}"
-}
-
-run_desktop_base() {
-  runuser -u "${DESKTOP_USER}" -- env \
-    "HOME=${HOME_DIR}" \
-    "USER=${DESKTOP_USER}" \
-    "LOGNAME=${DESKTOP_USER}" \
-    "LANG=en_US.UTF-8" \
-    "LC_CTYPE=en_US.UTF-8" \
-    "XDG_RUNTIME_DIR=${RUNTIME_DIR}" \
-    "${@}"
-}
-
-set_config_value() {
-  local key="$1"
-  local value="$2"
-  local file="${CONFIG_DIR}/sunshine.conf"
-
-  if grep -qE "^[[:space:]]*${key}[[:space:]]*=" "${file}"; then
-    sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = ${value}|" "${file}"
-  else
-    printf '%s = %s\n' "${key}" "${value}" >> "${file}"
-  fi
-}
-
-configure_network_resolution() {
-  install -d -m 755 "${SESSION_RUNTIME_DIR}"
-
-  write_resolv_conf "${RUNTIME_RESOLV_CONF}" || log "Failed to write ${RUNTIME_RESOLV_CONF}; DNS may not work."
-
-  write_resolv_conf /etc/resolv.conf || {
-    umount /etc/resolv.conf 2>/dev/null || true
-    write_resolv_conf /etc/resolv.conf || true
-  }
-
-  if [ -w /etc/nsswitch.conf ] && grep -q '^hosts:' /etc/nsswitch.conf; then
-    sed -i -E 's/^hosts:.*/hosts: files mymachines myhostname dns resolve/' /etc/nsswitch.conf
-  fi
-
-  if [ -w /etc/gai.conf ]; then
-    grep -v -E '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+' /etc/gai.conf > /tmp/arch-sunshine-gai.conf
-    cat /tmp/arch-sunshine-gai.conf > /etc/gai.conf
-    rm -f /tmp/arch-sunshine-gai.conf
-    printf 'precedence ::ffff:0:0/96  100\n' >> /etc/gai.conf
-  fi
-
-  if command -v setcap >/dev/null 2>&1 && [ -x /usr/bin/ping ]; then
-    setcap cap_net_raw+ep /usr/bin/ping 2>/dev/null || chmod 4755 /usr/bin/ping 2>/dev/null || true
-  elif [ -x /usr/bin/ping ]; then
-    chmod 4755 /usr/bin/ping 2>/dev/null || true
-  fi
-}
-
-write_resolv_conf() {
-  local target="$1"
-  local server
-
-  {
-    printf '# Managed by arch-sunshine. Override with SUNSHINE_DNS_SERVERS.\n'
-    for server in ${DNS_SERVERS}; do
-      printf 'nameserver %s\n' "${server}"
-    done
-    printf 'options timeout:1 attempts:2 rotate single-request-reopen\n'
-  } > "${target}" 2>/dev/null || return 1
-
-  grep -q '^nameserver ' "${target}" 2>/dev/null
-}
-
-mount_runtime_resolv_conf() {
-  if [ ! -s "${RUNTIME_RESOLV_CONF}" ]; then
-    write_resolv_conf "${RUNTIME_RESOLV_CONF}" || return 1
-  fi
-
-  mount --bind "${RUNTIME_RESOLV_CONF}" /etc/resolv.conf 2>/dev/null || return 1
-  mount -o remount,bind,ro /etc/resolv.conf 2>/dev/null || true
-}
-
-sanitize_positive_int() {
-  local fallback="$2"
-  local max="$3"
-  local value="$1"
-
-  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
-    printf '%s\n' "${fallback}"
-    return
-  fi
-
-  value=$((10#${value}))
-  if [ "${value}" -lt 1 ] || [ "${value}" -gt "${max}" ]; then
-    printf '%s\n' "${fallback}"
-    return
-  fi
-
-  printf '%s\n' "${value}"
-}
-
-sanitize_refresh_rate() {
-  local fallback="$2"
-  local integer_part
-  local value="$1"
-
-  if [[ ! "${value}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-    printf '%s\n' "${fallback}"
-    return
-  fi
-
-  integer_part="${value%%.*}"
-  integer_part=$((10#${integer_part}))
-  if [ "${integer_part}" -lt 1 ] || [ "${integer_part}" -gt 240 ]; then
-    printf '%s\n' "${fallback}"
-    return
-  fi
-
-  printf '%s\n' "${value}"
-}
-
-sanitize_scale_request() {
-  local fallback="$2"
-  local value="$1"
-
-  if [ "${value}" = "auto" ]; then
-    printf '%s\n' "${value}"
-    return
-  fi
-
-  if [[ ! "${value}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-    printf '%s\n' "${fallback}"
-    return
-  fi
-
-  awk -v value="${value}" -v fallback="${fallback}" '
-    BEGIN {
-      if (value < 0.5 || value > 4) {
-        print fallback
-      } else {
-        sub(/\.?0+$/, "", value)
-        print value
-      }
-    }
-  '
-}
-
-resolve_session_scale() {
-  local requested
-
-  requested="$(sanitize_scale_request "${1:-${DEFAULT_SCALE}}" auto)"
-  if [ "${requested}" != "auto" ]; then
-    printf '%s\n' "${requested}"
-    return
-  fi
-
-  if [ "${WIDTH}" -ge 3840 ] || [ "${HEIGHT}" -ge 2160 ]; then
-    printf '2\n'
-  elif [ "${WIDTH}" -ge 2880 ] || [ "${HEIGHT}" -ge 1800 ]; then
-    printf '1.75\n'
-  elif [ "${WIDTH}" -ge 2560 ] || [ "${HEIGHT}" -ge 1440 ]; then
-    printf '1.5\n'
-  elif [ "${WIDTH}" -ge 1921 ] || [ "${HEIGHT}" -ge 1200 ]; then
-    printf '1.25\n'
-  else
-    printf '1\n'
-  fi
-}
-
-scale_to_dpi() {
-  awk -v scale="${1:-1}" 'BEGIN { printf "%d\n", (96 * scale) + 0.5 }'
-}
-
-set_session_geometry() {
-  WIDTH="$(sanitize_positive_int "${1:-${DEFAULT_WIDTH}}" "${DEFAULT_WIDTH}" 8192)"
-  HEIGHT="$(sanitize_positive_int "${2:-${DEFAULT_HEIGHT}}" "${DEFAULT_HEIGHT}" 8192)"
-  REFRESH_RATE="$(sanitize_refresh_rate "${3:-${DEFAULT_REFRESH_RATE}}" "${DEFAULT_REFRESH_RATE}")"
-  SCALE="$(resolve_session_scale "${4:-${DEFAULT_SCALE}}")"
-}
-
-xrandr_mode_name() {
-  local generated
-
-  generated="$(
-    cvt "${WIDTH}" "${HEIGHT}" "${REFRESH_RATE}" 2>/dev/null \
-      | awk '/Modeline/ { gsub(/"/, "", $2); print $2; exit }'
-  )"
-  if [ -n "${generated}" ]; then
-    printf '%s\n' "${generated}"
-  else
-    printf '%sx%s_%s\n' "${WIDTH}" "${HEIGHT}" "${REFRESH_RATE}"
-  fi
-}
-
-xrandr_monitor_exists() {
-  local name="$1"
-
-  DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --listmonitors 2>/dev/null \
-    | awk -v name="${name}" '
-        NR > 1 {
-          monitor = $2
-          sub(/^[+*]+/, "", monitor)
-          if (monitor == name) {
-            found = 1
-          }
-        }
-        END { exit found ? 0 : 1 }
-      '
-}
-
-x_display_available() {
-  DISPLAY="${DISPLAY_NAME}" timeout 3s xdpyinfo >/dev/null 2>&1
-}
-
-delete_xrandr_monitor() {
-  local name="$1"
-
-  if xrandr_monitor_exists "${name}"; then
-    DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --delmonitor "${name}" \
-      >>"${LOG_DIR}/xrandr.log" 2>&1 || true
-  fi
-}
-
-reset_session_vars() {
-  XORG_PID=""
-  XWAYLAND_PID=""
-  WESTON_PID=""
-  PLASMA_PID=""
-  NETWORK_STATUS_PID=""
-  INPUT_BRIDGE_PID=""
-  WIREPLUMBER_PID=""
-  PIPEWIRE_PULSE_PID=""
-  PIPEWIRE_PID=""
-  SESSION_DBUS_PID=""
-  SYSTEM_DBUS_PID=""
-  DESKTOP_ACTIVE=0
-}
-
-ensure_persistent_home_ownership() {
-  mkdir -p "$(dirname "${HOME_OWNERSHIP_MARKER}")"
-
-  if [ -f "${HOME_OWNERSHIP_MARKER}" ]; then
-    chown "${DESKTOP_UID}:${DESKTOP_GID}" "${PERSISTENT_HOME_DIR}" "$(dirname "${HOME_OWNERSHIP_MARKER}")" 2>/dev/null || true
-    return 0
-  fi
-
-  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${PERSISTENT_HOME_DIR}"
-  printf '%s\n' "$(date -Is)" > "${HOME_OWNERSHIP_MARKER}"
-  chown "${DESKTOP_UID}:${DESKTOP_GID}" "${HOME_OWNERSHIP_MARKER}" "$(dirname "${HOME_OWNERSHIP_MARKER}")"
-}
-
-write_session_state() {
-  install -d -m 755 "${SESSION_RUNTIME_DIR}"
-  {
-    printf 'ACTIVE_DISPLAY_DRIVER=%q\n' "${ACTIVE_DISPLAY_DRIVER}"
-    printf 'DISPLAY_DRIVER=%q\n' "${DISPLAY_DRIVER}"
-    printf 'OUTPUT_NAME=%q\n' "${OUTPUT_NAME}"
-    printf 'WIDTH=%q\n' "${WIDTH}"
-    printf 'HEIGHT=%q\n' "${HEIGHT}"
-    printf 'REFRESH_RATE=%q\n' "${REFRESH_RATE}"
-    printf 'SCALE=%q\n' "${SCALE}"
-    printf 'DESKTOP_ACTIVE=%q\n' "${DESKTOP_ACTIVE:-0}"
-    printf 'XORG_PID=%q\n' "${XORG_PID:-}"
-    printf 'XWAYLAND_PID=%q\n' "${XWAYLAND_PID:-}"
-    printf 'WESTON_PID=%q\n' "${WESTON_PID:-}"
-    printf 'PLASMA_PID=%q\n' "${PLASMA_PID:-}"
-    printf 'NETWORK_STATUS_PID=%q\n' "${NETWORK_STATUS_PID:-}"
-    printf 'INPUT_BRIDGE_PID=%q\n' "${INPUT_BRIDGE_PID:-}"
-    printf 'WIREPLUMBER_PID=%q\n' "${WIREPLUMBER_PID:-}"
-    printf 'PIPEWIRE_PULSE_PID=%q\n' "${PIPEWIRE_PULSE_PID:-}"
-    printf 'PIPEWIRE_PID=%q\n' "${PIPEWIRE_PID:-}"
-    printf 'SESSION_DBUS_PID=%q\n' "${SESSION_DBUS_PID:-}"
-    printf 'SYSTEM_DBUS_PID=%q\n' "${SYSTEM_DBUS_PID:-}"
-  } > "${SESSION_STATE_FILE}"
-}
-
-load_session_state() {
-  reset_session_vars
-
-  if [ ! -f "${SESSION_STATE_FILE}" ]; then
-    return 1
-  fi
-
-  # The state file is root-owned runtime data created by write_session_state.
-  . "${SESSION_STATE_FILE}"
-}
-
-terminate_pid() {
-  local pid="$1"
-
-  if [ -z "${pid}" ] || ! kill -0 "${pid}" 2>/dev/null; then
-    return 0
-  fi
-
-  kill "${pid}" 2>/dev/null || true
-  for _ in $(seq 1 20); do
-    if ! kill -0 "${pid}" 2>/dev/null; then
-      return 0
-    fi
-    sleep 0.1
-  done
-  kill -KILL "${pid}" 2>/dev/null || true
-}
-
-terminate_pid_tree() {
-  local child pid="$1"
-
-  if [ -z "${pid}" ] || ! kill -0 "${pid}" 2>/dev/null; then
-    return 0
-  fi
-
-  for child in $(pgrep -P "${pid}" 2>/dev/null || true); do
-    terminate_pid_tree "${child}"
-  done
-
-  terminate_pid "${pid}"
-}
-
-terminate_desktop_user_processes_named() {
-  local name="$1"
-  local pid
-
-  for pid in $(pgrep -u "${DESKTOP_UID}" -x "${name}" 2>/dev/null || true); do
-    terminate_pid_tree "${pid}"
-  done
-}
-
-mount_runtime_tmpfs() {
-  local mode="$2"
-  local target="$1"
-
-  mkdir -p "${target}"
-  if mountpoint -q "${target}"; then
-    chmod "${mode}" "${target}"
-    return 0
-  fi
-
-  mount -t tmpfs -o "mode=${mode}" tmpfs "${target}"
-  chmod "${mode}" "${target}"
-}
-
-setup_runtime_writable_mounts() {
-  mount_runtime_tmpfs /run 0755
-  mount_runtime_tmpfs /tmp 1777
-  mount_runtime_tmpfs /var/tmp 1777
-  mount_runtime_tmpfs /var/cache 0755
-  mount_runtime_tmpfs /var/lib/dbus 0755
-  mount_runtime_tmpfs /var/lib/xkb 1777
-  mount_runtime_tmpfs /var/log 0755
-}
-
-root_filesystem_is_read_only() {
-  awk '
-    $2 == "/" {
-      split($4, options, ",")
-      for (option in options) {
-        if (options[option] == "ro") {
-          found = 1
-        }
-      }
-    }
-    END { exit found ? 0 : 1 }
-  ' /proc/mounts
-}
-
-lock_root_filesystem() {
-  if root_filesystem_is_read_only; then
-    return 0
-  fi
-
-  sync
-  if mount -o remount,ro / >/dev/null 2>&1; then
-    return 0
-  fi
-
-  log "Root filesystem remount is unsupported here; locking system paths read-only."
-  lock_system_paths_read_only
-}
-
-lock_read_only_path() {
-  local target="$1"
-
-  [ -d "${target}" ] || return 0
-
-  if ! mountpoint -q "${target}"; then
-    mount --bind "${target}" "${target}"
-  fi
-  mount -o remount,bind,ro "${target}"
-}
-
-lock_system_paths_read_only() {
-  local target
-  local targets=(
-    /usr
-    /etc
-    /opt
-    /boot
-    /root
-    /home
-    /var/lib/pacman
-    /var/spool
-    /srv
-  )
-
-  for target in "${targets[@]}"; do
-    lock_read_only_path "${target}"
-  done
-}
-
-ensure_machine_id() {
-  if [ ! -s /etc/machine-id ]; then
-    log "Image is missing /etc/machine-id; rebuild the image."
-    return 1
-  fi
-}
-
-acquire_session_lock() {
-  local owner waited
-
-  waited=0
-  install -d -m 755 "${SESSION_RUNTIME_DIR}"
-
-  until mkdir "${SESSION_LOCK_DIR}" 2>/dev/null; do
-    owner="$(cat "${SESSION_LOCK_DIR}/pid" 2>/dev/null || true)"
-    if [ -n "${owner}" ] && ! kill -0 "${owner}" 2>/dev/null; then
-      rm -rf "${SESSION_LOCK_DIR}"
-      continue
-    fi
-
-    if [ "${waited}" -ge 300 ]; then
-      log "Timed out waiting for desktop session lock."
-      return 1
-    fi
-
-    waited=$((waited + 1))
-    sleep 0.1
-  done
-
-  printf '%s\n' "$$" > "${SESSION_LOCK_DIR}/pid"
-}
-
-release_session_lock() {
-  rm -rf "${SESSION_LOCK_DIR}"
-}
-
-bind_home_dir() {
-  mkdir -p /home "${PERSISTENT_HOME_DIR}"
-
-  if mountpoint -q "${HOME_DIR}"; then
-    return 0
-  fi
-
-  if [ -L "${HOME_DIR}" ]; then
-    rm -f "${HOME_DIR}"
-  elif [ -e "${HOME_DIR}" ] && [ ! -d "${HOME_DIR}" ]; then
-    rm -f "${HOME_DIR}"
-  fi
-
-  mkdir -p "${HOME_DIR}"
-  mount --bind "${PERSISTENT_HOME_DIR}" "${HOME_DIR}"
-}
-
-normalize_desktop_paths() {
-  local places="${HOME_DIR}/.local/share/user-places.xbel"
-
-  cat > "${HOME_DIR}/.config/user-dirs.dirs" <<EOF
-XDG_DESKTOP_DIR="\$HOME/Desktop"
-XDG_DOWNLOAD_DIR="\$HOME/Downloads"
-XDG_TEMPLATES_DIR="\$HOME/Templates"
-XDG_PUBLICSHARE_DIR="\$HOME/Public"
-XDG_DOCUMENTS_DIR="\$HOME/Documents"
-XDG_MUSIC_DIR="\$HOME/Music"
-XDG_PICTURES_DIR="\$HOME/Pictures"
-XDG_VIDEOS_DIR="\$HOME/Videos"
-EOF
-
-  if [ -f "${places}" ]; then
-    sed -i \
-      -e "s|file://${USER_DATA}/home/retro|file://${HOME_DIR}|g" \
-      -e "s|file://${PERSISTENT_HOME_DIR}|file://${HOME_DIR}|g" \
-      "${places}"
-  fi
-}
-
-seed_konsole_profile() {
-  mkdir -p "${HOME_DIR}/.local/share/konsole"
-  cat > "${HOME_DIR}/.local/share/konsole/ArchSunshine.profile" <<EOF
-[General]
-Command=/bin/bash
-Name=Arch Sunshine
-Parent=FALLBACK/
-EOF
-
-  cat > "${HOME_DIR}/.config/konsolerc" <<EOF
-[Desktop Entry]
-DefaultProfile=ArchSunshine.profile
-EOF
-}
-
-drm_output_name_from_status_path() {
-  local drm_name
-
-  drm_name="$(basename "$(dirname "$1")")"
-  drm_name="${drm_name#card[0-9]-}"
-  drm_name="${drm_name/HDMI-A-/HDMI-}"
-  printf '%s\n' "${drm_name}"
-}
-
-detect_connected_output() {
-  local status_path
-
-  for status_path in /sys/class/drm/card*-*/status; do
-    [ -e "${status_path}" ] || continue
-    if [ "$(cat "${status_path}" 2>/dev/null || true)" = "connected" ]; then
-      drm_output_name_from_status_path "${status_path}"
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-resolve_display_driver() {
-  case "${DISPLAY_DRIVER}" in
-    auto)
-      if [ -e "${CARD_NODE}" ] && OUTPUT_NAME="$(detect_connected_output)"; then
-        ACTIVE_DISPLAY_DRIVER=modesetting
-      elif [ -e "${RENDER_NODE}" ] && command -v weston >/dev/null 2>&1 && command -v Xwayland >/dev/null 2>&1; then
-        ACTIVE_DISPLAY_DRIVER=xwayland
-      else
-        ACTIVE_DISPLAY_DRIVER=dummy
-      fi
-      ;;
-    modesetting)
-      if [ -z "${OUTPUT_NAME}" ]; then
-        OUTPUT_NAME="$(detect_connected_output || true)"
-      fi
-      if [ -z "${OUTPUT_NAME}" ]; then
-        OUTPUT_NAME=DP-1
-      fi
-      ACTIVE_DISPLAY_DRIVER=modesetting
-      ;;
-    xwayland)
-      ACTIVE_DISPLAY_DRIVER=xwayland
-      ;;
-    *)
-      ACTIVE_DISPLAY_DRIVER=dummy
-      ;;
-  esac
-}
-
-setup_user_data() {
-  if [ -d "${USER_DATA}/home/retro" ] && [ ! -e "${PERSISTENT_HOME_DIR}" ]; then
-    mv "${USER_DATA}/home/retro" "${PERSISTENT_HOME_DIR}"
-  fi
-
-  mkdir -p "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}" "${RUNTIME_DIR}" "${SESSION_RUNTIME_DIR}"
-  install -d -o "${DESKTOP_UID}" -g "${DESKTOP_GID}" "${PERSISTENT_HOME_DIR}"
-  install -d -o "${DESKTOP_UID}" -g "${DESKTOP_GID}" \
-    "${PERSISTENT_HOME_DIR}/.cache" \
-    "${PERSISTENT_HOME_DIR}/.config" \
-    "${PERSISTENT_HOME_DIR}/.local/share" \
-    "${PERSISTENT_HOME_DIR}/Desktop" \
-    "${PERSISTENT_HOME_DIR}/Documents" \
-    "${PERSISTENT_HOME_DIR}/Downloads" \
-    "${PERSISTENT_HOME_DIR}/Music" \
-    "${PERSISTENT_HOME_DIR}/Pictures" \
-    "${PERSISTENT_HOME_DIR}/Projects" \
-    "${PERSISTENT_HOME_DIR}/Public" \
-    "${PERSISTENT_HOME_DIR}/Templates" \
-    "${PERSISTENT_HOME_DIR}/Videos"
-  ensure_persistent_home_ownership
-  bind_home_dir
-
-  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}"
-  chown "${DESKTOP_UID}:${DESKTOP_GID}" "${RUNTIME_DIR}"
-  chmod 700 "${RUNTIME_DIR}"
-  chmod 1777 /var/lib/xkb
-  chmod 1777 /tmp
-  rm -f "${RUNTIME_DIR}"/wayland-* "${RUNTIME_DIR}"/sway-ipc.*.sock
-  rm -f /tmp/.X"${DISPLAY_NUM}"-lock
-  rm -f /tmp/.X11-unix/X"${DISPLAY_NUM}"
-  chmod 666 /dev/uinput /dev/uhid 2>/dev/null || true
-  chmod 666 /dev/dri/card* /dev/dri/renderD* 2>/dev/null || true
-
-  mkdir -p /var/lib/dbus
-  if [ ! -e /var/lib/dbus/machine-id ]; then
-    cp /etc/machine-id /var/lib/dbus/machine-id
-  fi
-
-  if [ ! -f "${CONFIG_DIR}/sunshine.conf" ]; then
-    cp /usr/share/arch-sunshine/sunshine/sunshine.conf "${CONFIG_DIR}/sunshine.conf"
-  fi
-  cp /usr/share/arch-sunshine/sunshine/apps.json "${CONFIG_DIR}/apps.json"
-
-  set_config_value capture x11
-  set_config_value file_apps "${CONFIG_DIR}/apps.json"
-  set_config_value file_state "${STATE_DIR}/sunshine_state.json"
-  set_config_value credentials_file "${STATE_DIR}/sunshine_state.json"
-  set_config_value log_path "${LOG_DIR}/sunshine.log"
-  set_config_value stream_audio enabled
-  set_config_value audio_sink arch_sunshine_audio.monitor
-  set_config_value virtual_sink arch_sunshine_audio
-  set_config_value system_tray disabled
-  set_config_value global_prep_cmd '[{"do":"/usr/local/bin/arch-sunshine client-start","undo":"/usr/local/bin/arch-sunshine client-stop"}]'
-  rm -f "${HOME_DIR}/.cache/ksycoca6"*
-  rm -rf "${HOME_DIR}/.cache/menus"
-  rm -rf "${HOME_DIR}/.local/share/kscreen"
-  rm -rf "${HOME_DIR}/.config/session"
-  normalize_desktop_paths
-  seed_konsole_profile
-  seed_steam_install
-  seed_disconnect_launcher
-  cat > "${HOME_DIR}/.config/ksplashrc" <<EOF
-[KSplash]
-Engine=none
-EOF
-  cat > "${HOME_DIR}/.config/kded6rc" <<EOF
-[Module-kscreen]
-autoload=false
-EOF
-  cat > "${HOME_DIR}/.config/kded5rc" <<EOF
-[Module-kscreen]
-autoload=false
-EOF
-  cat > "${HOME_DIR}/.config/ksmserverrc" <<EOF
-[General]
-loginMode=emptySession
-EOF
-  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" \
-    "${CONFIG_DIR}" \
-    "${STATE_DIR}" \
-    "${LOG_DIR}" \
-    "${HOME_DIR}/.cache" \
-    "${HOME_DIR}/.config" \
-    "${HOME_DIR}/.local/share/konsole" \
-    "${HOME_DIR}/Desktop"
-
-  run_as_desktop_user xdg-user-dirs-update >/dev/null 2>&1 || true
-  run_as_desktop_user kbuildsycoca6 --noincremental \
-    >"${LOG_DIR}/kbuildsycoca.log" 2>&1 || true
-}
-
-seed_input_devices() {
-  local event minor
-
-  mkdir -p /dev/input /run/udev/data
-
-  for event in $(seq 0 63); do
-    minor=$((64 + event))
-    mknod -m 666 "/dev/input/event${event}" c 13 "${minor}" 2>/dev/null || true
-    chmod 666 "/dev/input/event${event}" 2>/dev/null || true
-    cat > "/run/udev/data/c13:${minor}" <<EOF
-I:0
-E:ID_INPUT=1
-E:ID_INPUT_KEYBOARD=1
-E:ID_INPUT_MOUSE=1
-E:ID_SEAT=seat0
-E:ID_FOR_SEAT=input-event${event}
-G:seat
-Q:seat
-V:1
-EOF
-  done
-}
-
-seed_web_credentials() {
-  run_as_desktop_user sunshine "${CONFIG_DIR}/sunshine.conf" --creds "${WEB_UI_USER}" "${WEB_UI_PASS}" \
-    >"${LOG_DIR}/credentials.log" 2>&1
-}
-
-seed_disconnect_launcher() {
-  mkdir -p "$(dirname "${DISCONNECT_DESKTOP_FILE}")" "$(dirname "${DISCONNECT_DESKTOP_ICON}")"
-
-  cat > "${DISCONNECT_DESKTOP_FILE}" <<'EOF'
-[Desktop Entry]
-Type=Application
-Name=Disconnect
-Comment=Close the Moonlight stream and stop the desktop session
-Exec=/usr/local/bin/arch-sunshine disconnect
-Icon=system-log-out
-Terminal=false
-Categories=System;
-StartupNotify=false
-NoDisplay=false
-EOF
-
-  cp "${DISCONNECT_DESKTOP_FILE}" "${DISCONNECT_DESKTOP_ICON}"
-  chmod 644 "${DISCONNECT_DESKTOP_FILE}"
-  chmod 755 "${DISCONNECT_DESKTOP_ICON}"
-  chown "${DESKTOP_UID}:${DESKTOP_GID}" "${DISCONNECT_DESKTOP_FILE}" "${DISCONNECT_DESKTOP_ICON}"
-}
-
-ensure_steam_links() {
-  local steam_config="${PERSISTENT_HOME_DIR}/.steam"
-
-  install -d -o "${DESKTOP_UID}" -g "${DESKTOP_GID}" "${steam_config}"
-  ln -sfn "${HOME_DIR}/.local/share/Steam" "${steam_config}/steam"
-  ln -sfn "${HOME_DIR}/.local/share/Steam" "${steam_config}/root"
-  ln -sfn "${HOME_DIR}/.local/share/Steam/ubuntu12_32" "${steam_config}/bin32"
-  ln -sfn "${HOME_DIR}/.local/share/Steam/ubuntu12_64" "${steam_config}/bin64"
-  ln -sfn "${HOME_DIR}/.local/share/Steam/linux32" "${steam_config}/sdk32"
-  ln -sfn "${HOME_DIR}/.local/share/Steam/linux64" "${steam_config}/sdk64"
-  ln -sfn "${HOME_DIR}/.steam/bin32" "${steam_config}/bin"
-  rm -f "${steam_config}/steam.pid" "${steam_config}/steam.pipe" "${steam_config}/steam.token"
-  chown -h "${DESKTOP_UID}:${DESKTOP_GID}" "${steam_config}" "${steam_config}"/* 2>/dev/null || true
-}
-
-configure_steam_defaults() {
-  local steam_config="${PERSISTENT_HOME_DIR}/.steam"
-  local steam_dev_config="${PERSISTENT_HOME_DIR}/.local/share/Steam/steam_dev.cfg"
-  local steam_dir="${PERSISTENT_HOME_DIR}/.local/share/Steam"
-  local threads
-
-  install -d -o "${DESKTOP_UID}" -g "${DESKTOP_GID}" "${steam_dir}" "${steam_dir}/config"
-  touch "${steam_dir}/config/SteamAppData.vdf" 2>/dev/null || true
-
-  if [ ! -f "${steam_dev_config}" ] || ! grep -q '^unShaderBackgroundProcessingThreads ' "${steam_dev_config}"; then
-    threads=$(($(nproc) - 2))
-    if [ "${threads}" -gt 16 ]; then
-      threads=16
-    elif [ "${threads}" -lt 1 ]; then
-      threads=1
-    fi
-    printf 'unShaderBackgroundProcessingThreads %s\n' "${threads}" >> "${steam_dev_config}"
-  fi
-
-  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${steam_config}" 2>/dev/null || true
-  chown "${DESKTOP_UID}:${DESKTOP_GID}" \
-    "${steam_dir}" \
-    "${steam_dir}/config" \
-    "${steam_dir}/config/SteamAppData.vdf" \
-    "${steam_dev_config}" 2>/dev/null || true
-}
-
-seed_steam_install() {
-  local steam_dir="${PERSISTENT_HOME_DIR}/.local/share/Steam"
-
-  if [ ! -x "${steam_dir}/steam.sh" ] && [ -f "${STEAM_BOOTSTRAP_TAR}" ]; then
-    log "Bootstrapping Steam client into ${steam_dir}."
-    rm -rf "${steam_dir}"
-    install -d -o "${DESKTOP_UID}" -g "${DESKTOP_GID}" "$(dirname "${steam_dir}")" "${steam_dir}"
-    if ! run_desktop_base tar -xJf "${STEAM_BOOTSTRAP_TAR}" -C "${HOME_DIR}/.local/share/Steam"; then
-      if [ ! -x "${steam_dir}/steam.sh" ]; then
-        return 1
-      fi
-      log "Steam bootstrap completed with filesystem warnings; continuing."
-    fi
-  fi
-
-  ensure_steam_links
-  configure_steam_defaults
-}
-
-write_desktop_env() {
-  mkdir -p "${HOME_DIR}/.config/plasma-workspace/env"
-  cat > "${HOME_DIR}/.config/plasma-workspace/env/arch-sunshine.sh" <<EOF
-export XDG_CURRENT_DESKTOP=KDE
-export XDG_MENU_PREFIX=plasma-
-export XDG_SESSION_DESKTOP=KDE
-export XDG_SESSION_TYPE=x11
-export DESKTOP_SESSION=plasma
-export KDE_SESSION_VERSION=6
-export KDE_FULL_SESSION=true
-export KWIN_COMPOSE=N
-export QT_QPA_PLATFORM=xcb
-export MOZ_ENABLE_WAYLAND=0
-export GIO_USE_NETWORK_MONITOR=base
-export RES_OPTIONS="timeout:1 attempts:2 rotate single-request-reopen"
-export SDL_VIDEODRIVER=x11
-export LIBGL_DRI3_ENABLE=1
-export PULSE_SERVER=unix:${RUNTIME_DIR}/pulse/native
-export STEAM_RUNTIME=1
-export SRT_URLOPEN_PREFER_STEAM=1
-export STEAM_DISABLE_AUDIO_DEVICE_SWITCHING=1
-EOF
-  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${HOME_DIR}/.config"
-}
-
-active_xrandr_output() {
-  DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --query 2>/dev/null \
-    | awk '/ connected/ { print $1; exit }'
-}
-
-write_kde_config_value() {
-  local file="$1"
-  local group="$2"
-  local key="$3"
-  local value="$4"
-
-  command -v kwriteconfig6 >/dev/null 2>&1 || return 1
-  run_desktop_base \
-    "XDG_CONFIG_HOME=${HOME_DIR}/.config" \
-    kwriteconfig6 \
-      --file "${file}" \
-      --group "${group}" \
-      --key "${key}" \
-      "${value}" >/dev/null 2>&1
-}
-
-write_kde_action_restrictions() {
-  local file="${HOME_DIR}/.config/kdeglobals"
-
-  write_kde_config_value kdeglobals "KDE Action Restrictions" "action/lock_screen" false || true
-  write_kde_config_value kdeglobals "KDE Action Restrictions" lock_screen false || true
-  write_kde_config_value kdeglobals "KDE Action Restrictions" logout false || true
-  write_kde_config_value kdeglobals "KDE Action Restrictions" "action/logout" false || true
-
-  if [ -f "${file}" ]; then
-    sed -i -E 's/^\[KDE Action Restrictions\]$/[KDE Action Restrictions][$i]/' "${file}"
-  fi
-}
-
-write_kde_session_config() {
-  local dpi output scale_factors
-
-  dpi="$(scale_to_dpi "${SCALE}")"
-  output="$(active_xrandr_output || true)"
-  if [ -z "${output}" ] || [ "${output}" = "none" ]; then
-    if [ "${ACTIVE_DISPLAY_DRIVER}" = "xwayland" ]; then
-      output=XWAYLAND0
-    else
-      output="${OUTPUT_NAME:-ArchSunshine}"
-    fi
-  fi
-  scale_factors="${output}=${SCALE};"
-
-  mkdir -p "${HOME_DIR}/.config"
-  write_kde_config_value kwinrc Compositing Enabled false || true
-  write_kde_config_value kdeglobals KScreen ScaleFactor "${SCALE}" || true
-  write_kde_config_value kdeglobals KScreen ScreenScaleFactors "${scale_factors}" || true
-  write_kde_config_value kdeglobals General Xft.dpi "${dpi}" || true
-  write_kde_config_value kcmfonts General forceFontDPI "${dpi}" || true
-  write_kde_action_restrictions
-  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${HOME_DIR}/.config"
-}
-
-apply_xrandr_dpi() {
-  local dpi
-
-  dpi="$(scale_to_dpi "${SCALE}")"
-  DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --dpi "${dpi}" \
-    >>"${LOG_DIR}/xrandr.log" 2>&1 || true
-}
-
-apply_desktop_scale_runtime() {
-  local output
-
-  write_kde_session_config
-  apply_xrandr_dpi
-
-  output="$(active_xrandr_output || true)"
-  if [ -n "${output}" ] && [ "${output}" != "none" ]; then
-    run_as_desktop_user timeout 2s kscreen-doctor "output.${output}.scale.${SCALE}" \
-      >"${LOG_DIR}/scale.log" 2>&1 || true
-  fi
-
-  run_as_desktop_user timeout 2s qdbus6 org.kde.KWin /KWin reconfigure \
-    >>"${LOG_DIR}/scale.log" 2>&1 || true
-  run_as_desktop_user timeout 2s qdbus6 org.kde.KWin /Compositor suspend \
-    >>"${LOG_DIR}/scale.log" 2>&1 || true
-}
-
-ensure_disconnect_panel_button() {
-  local launcher_url output script
-
-  if [ -f "${DISCONNECT_PANEL_MARKER}" ] || [ ! -f "${DISCONNECT_DESKTOP_FILE}" ]; then
-    return 0
-  fi
-
-  command -v qdbus6 >/dev/null 2>&1 || return 0
-  launcher_url="file://${DISCONNECT_DESKTOP_FILE}"
-  script="$(cat <<EOF
-var result = "arch-sunshine-disconnect-no-panel";
-var panelList = panels();
-if (panelList.length > 0) {
-    var widget = panelList[0].addWidget("org.kde.plasma.icon");
-    widget.currentConfigGroup = ["General"];
-    widget.writeConfig("url", "${launcher_url}");
-    result = "arch-sunshine-disconnect-added";
-}
-print(result);
-result;
-EOF
-)"
-
-  if output="$(
-    run_as_desktop_user timeout 2s qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "${script}" 2>&1
-  )"; then
-    printf '%s\n' "${output}" >"${LOG_DIR}/disconnect-panel.log"
-  else
-    printf '%s\n' "${output}" >"${LOG_DIR}/disconnect-panel.log"
-    return 0
-  fi
-
-  sleep 0.2
-  if printf '%s\n' "${output}" | grep -q 'arch-sunshine-disconnect-added' \
-    || grep -Fqx "url=${launcher_url}" "${HOME_DIR}/.config/plasma-org.kde.plasma.desktop-appletsrc" 2>/dev/null; then
-    touch "${DISCONNECT_PANEL_MARKER}"
-    chown "${DESKTOP_UID}:${DESKTOP_GID}" "${DISCONNECT_PANEL_MARKER}"
-  fi
-}
-
-ensure_panel_task_launchers() {
-  local applet_group group_args group_part launchers output script
-
-  launchers="applications:org.kde.dolphin.desktop,applications:firefox.desktop,applications:steam.desktop"
-
-  if command -v kwriteconfig6 >/dev/null 2>&1 && [ -f "${HOME_DIR}/.config/plasma-org.kde.plasma.desktop-appletsrc" ]; then
-    while IFS= read -r applet_group; do
-      applet_group="${applet_group#[}"
-      applet_group="${applet_group%]}"
-      group_args=()
-      while IFS= read -r group_part; do
-        group_args+=(--group "${group_part}")
-      done < <(printf '%s\n' "${applet_group}" | sed 's/]\[/\n/g')
-
-      run_as_desktop_user kwriteconfig6 \
-        --file "${HOME_DIR}/.config/plasma-org.kde.plasma.desktop-appletsrc" \
-        "${group_args[@]}" \
-        --group Configuration \
-        --group General \
-        --key launchers \
-        "${launchers}" >/dev/null 2>&1 || true
-    done < <(
-      awk '
-        /^\[Containments\]\[[^]]+\]\[Applets\]\[[^]]+\]$/ {
-          group = $0
-          in_group = 1
-          next
-        }
-        /^\[/ {
-          in_group = 0
-        }
-        in_group && $0 == "plugin=org.kde.plasma.icontasks" {
-          print group
-        }
-      ' "${HOME_DIR}/.config/plasma-org.kde.plasma.desktop-appletsrc"
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import pwd
+import select
+import shlex
+import shutil
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import termios
+import time
+import tty
+from pathlib import Path
+
+
+DEFAULT_CONFIG = Path("/usr/share/arch-sunshine/pipelines.json")
+USER_DATA = Path("/mnt/user_data")
+DESKTOP_USER = os.environ.get("SUNSHINE_DESKTOP_USER", "sunshine")
+DESKTOP_UID = 1000
+DESKTOP_GID = 1000
+HOME_DIR = Path(f"/home/{DESKTOP_USER}")
+PERSISTENT_HOME_DIR = USER_DATA / "home" / DESKTOP_USER
+LOG_DIR = USER_DATA / "var" / "log" / "arch-sunshine"
+SUNSHINE_CONFIG_DIR = USER_DATA / "etc" / "sunshine"
+SUNSHINE_STATE_DIR = USER_DATA / "var" / "lib" / "sunshine"
+DEFAULT_RUNTIME_DIR = Path("/run/user/1000")
+DEFAULT_SOCKET = "arch-sunshine-wayland"
+CONTROL_FIFO_NAME = "arch-sunshine-control.fifo"
+DISCONNECT_DESKTOP_ID = "arch-sunshine-disconnect.desktop"
+DISCONNECT_DESKTOP_FILE = HOME_DIR / ".local" / "share" / "applications" / "arch-sunshine-disconnect.desktop"
+DISCONNECT_DESKTOP_ICON = HOME_DIR / "Desktop" / "arch-sunshine-disconnect.desktop"
+KWIN_OUTPUT_NAMES = ("Virtual-0", "ArchSunshine")
+DEFAULT_WIDTH = "1920"
+DEFAULT_HEIGHT = "1080"
+DEFAULT_FPS = "60"
+DEFAULT_SCALE = "auto"
+ELEMENT_CACHE = {}
+
+
+class StreamError(RuntimeError):
+    pass
+
+
+def eprint(*parts):
+    print(*parts, file=sys.stderr)
+
+
+def load_config(path):
+    try:
+        with Path(path).open("r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError as exc:
+        raise StreamError(f"pipeline config not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise StreamError(f"pipeline config is invalid JSON: {path}: {exc}") from exc
+
+
+def command_available(name):
+    return shutil.which(name) is not None
+
+
+def sanitize_positive_int(value, fallback, maximum):
+    try:
+        parsed = int(str(value), 10)
+    except (TypeError, ValueError):
+        return int(fallback)
+    if parsed < 1 or parsed > maximum:
+        return int(fallback)
+    return parsed
+
+
+def sanitize_refresh_rate(value, fallback):
+    try:
+        parsed = float(str(value))
+    except (TypeError, ValueError):
+        return str(fallback)
+    if parsed <= 0 or parsed > 240:
+        return str(fallback)
+    if parsed.is_integer():
+        return str(int(parsed))
+    return f"{parsed:g}"
+
+
+def sanitize_scale_request(value, fallback=DEFAULT_SCALE):
+    text = str(value if value is not None else fallback).strip()
+    if text == "auto":
+        return text
+    try:
+        parsed = float(text)
+    except ValueError:
+        return str(fallback)
+    if parsed < 0.5 or parsed > 4:
+        return str(fallback)
+    if parsed.is_integer():
+        return str(int(parsed))
+    return f"{parsed:g}"
+
+
+def scale_value(value, fallback=1.0):
+    try:
+        parsed = float(str(value))
+    except (TypeError, ValueError):
+        return fallback
+    if parsed <= 0:
+        return fallback
+    return parsed
+
+
+def format_scale(value):
+    if value.is_integer():
+        return str(int(value))
+    return f"{value:g}"
+
+
+def resolve_session_scale(width, height, requested=DEFAULT_SCALE):
+    requested = sanitize_scale_request(requested, DEFAULT_SCALE)
+    if requested != "auto":
+        return requested
+    if width >= 3840 or height >= 2160:
+        return "2"
+    if width >= 2880 or height >= 1800:
+        return "1.75"
+    if width >= 2560 or height >= 1440:
+        return "1.5"
+    if width >= 1921 or height >= 1200:
+        return "1.25"
+    return "1"
+
+
+def resolve_client_scale(width, height):
+    user_scale = sanitize_scale_request(os.environ.get("SUNSHINE_SCALE", DEFAULT_SCALE), DEFAULT_SCALE)
+    if user_scale != "auto":
+        return user_scale
+
+    auto_scale = resolve_session_scale(width, height, DEFAULT_SCALE)
+    client_scale = sanitize_scale_request(os.environ.get("SUNSHINE_CLIENT_SCALE", DEFAULT_SCALE), DEFAULT_SCALE)
+    if client_scale == "auto":
+        return auto_scale
+    return format_scale(max(scale_value(auto_scale), scale_value(client_scale)))
+
+
+def kwin_virtual_geometry(width, height, scale):
+    # KWin's virtual backend treats geometry as device-independent size.
+    scale_factor = scale_value(scale)
+    return (
+        max(1, int(round(width / scale_factor))),
+        max(1, int(round(height / scale_factor))),
     )
-  fi
 
-  command -v qdbus6 >/dev/null 2>&1 || return 0
-  script="$(cat <<EOF
-var launchers = "${launchers}";
-var changed = 0;
-panels().forEach(function(panel) {
-    panel.widgets().forEach(function(widget) {
-        var plugin = widget.type || widget.pluginName || "";
-        if (plugin == "org.kde.plasma.icontasks") {
-            widget.currentConfigGroup = ["General"];
-            widget.writeConfig("launchers", launchers);
-            changed++;
-        }
-    });
-});
-print("arch-sunshine-panel-launchers-set=" + changed);
-"arch-sunshine-panel-launchers-set=" + changed;
-EOF
-)"
 
-  for _ in $(seq 1 5); do
-    if output="$(
-        run_as_desktop_user timeout 2s qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript "${script}" 2>&1
-    )"; then
-      printf '%s\n' "${output}" >"${LOG_DIR}/panel-launchers.log"
-      if printf '%s\n' "${output}" | grep -q 'arch-sunshine-panel-launchers-set=[1-9]'; then
+def plasma_scale_text(scale):
+    return format_scale(scale_value(scale))
+
+
+def plasma_scale_dpi(scale):
+    return max(1, int(round(96 * scale_value(scale))))
+
+
+def plasma_screen_scale_factors(scale):
+    scale_text = plasma_scale_text(scale)
+    return "".join(f"{name}={scale_text};" for name in KWIN_OUTPUT_NAMES)
+
+
+def default_geometry():
+    width = sanitize_positive_int(os.environ.get("SUNSHINE_WIDTH", DEFAULT_WIDTH), DEFAULT_WIDTH, 8192)
+    height = sanitize_positive_int(os.environ.get("SUNSHINE_HEIGHT", DEFAULT_HEIGHT), DEFAULT_HEIGHT, 8192)
+    fps = sanitize_refresh_rate(os.environ.get("SUNSHINE_FPS", DEFAULT_FPS), DEFAULT_FPS)
+    scale = resolve_session_scale(width, height, os.environ.get("SUNSHINE_SCALE", DEFAULT_SCALE))
+    return width, height, fps, scale
+
+
+def requested_client_geometry():
+    default_width, default_height, default_fps, _default_scale = default_geometry()
+    width = sanitize_positive_int(os.environ.get("SUNSHINE_CLIENT_WIDTH", default_width), default_width, 8192)
+    height = sanitize_positive_int(os.environ.get("SUNSHINE_CLIENT_HEIGHT", default_height), default_height, 8192)
+    fps = sanitize_refresh_rate(os.environ.get("SUNSHINE_CLIENT_FPS", default_fps), default_fps)
+    scale = resolve_client_scale(width, height)
+    return width, height, fps, scale
+
+
+def kactivitymanagerd_command():
+    system_path = Path("/usr/lib/kactivitymanagerd")
+    if system_path.exists():
+        return [str(system_path)]
+    if command_available("kactivitymanagerd"):
+        return ["kactivitymanagerd"]
+    return None
+
+
+def run_checked(command, **kwargs):
+    return subprocess.run(command, check=False, **kwargs)
+
+
+def process_running(name):
+    return run_checked(
+        ["pgrep", "-x", name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def running_as_root():
+    return os.geteuid() == 0
+
+
+def ensure_desktop_user():
+    try:
+        pwd.getpwnam(DESKTOP_USER)
+    except KeyError as exc:
+        raise StreamError(f"desktop user {DESKTOP_USER!r} does not exist") from exc
+
+
+def chown_path(path, recursive=False):
+    command = ["chown"]
+    if recursive:
+        command.append("-R")
+    command.extend([f"{DESKTOP_UID}:{DESKTOP_GID}", str(path)])
+    run_checked(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def path_is_mountpoint(path):
+    return run_checked(
+        ["mountpoint", "-q", str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def bind_persistent_home():
+    HOME_DIR.mkdir(parents=True, exist_ok=True)
+    PERSISTENT_HOME_DIR.mkdir(parents=True, exist_ok=True)
+    if path_is_mountpoint(HOME_DIR):
+        return
+    result = run_checked(
+        ["mount", "--bind", str(PERSISTENT_HOME_DIR), str(HOME_DIR)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        raise StreamError(f"failed to bind {PERSISTENT_HOME_DIR} to {HOME_DIR}")
+
+
+def sync_input_device_nodes():
+    input_dir = Path("/dev/input")
+    input_dir.mkdir(parents=True, exist_ok=True)
+    input_dir.chmod(0o755)
+    changed = False
+
+    for event_path in sorted(Path("/sys/class/input").glob("event*")):
+        dev_file = event_path / "dev"
+        if not dev_file.exists():
+            continue
+        try:
+            major_text, minor_text = dev_file.read_text(encoding="utf-8").strip().split(":", 1)
+            major = int(major_text)
+            minor = int(minor_text)
+        except (OSError, ValueError):
+            continue
+
+        node = input_dir / event_path.name
+        try:
+            if not node.exists():
+                os.mknod(node, stat.S_IFCHR | 0o666, os.makedev(major, minor))
+                changed = True
+            os.chmod(node, 0o666)
+        except OSError:
+            pass
+    return changed
+
+
+def input_device_node_watcher():
+    while True:
+        if sync_input_device_nodes():
+            run_checked(
+                ["udevadm", "trigger", "--action=add", "-s", "input"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        time.sleep(0.2)
+
+
+def start_input_device_node_watcher():
+    thread = threading.Thread(target=input_device_node_watcher, name="input-device-node-watcher", daemon=True)
+    thread.start()
+    return thread
+
+
+def start_udev_stack():
+    udevd = Path("/usr/lib/systemd/systemd-udevd")
+    if not udevd.exists():
+        sync_input_device_nodes()
+        return
+
+    Path("/run/udev/data").mkdir(parents=True, exist_ok=True)
+    if not process_running("systemd-udevd"):
+        with (LOG_DIR / "udevd.log").open("ab") as log_handle:
+            run_checked([str(udevd), "--daemon"], stdout=log_handle, stderr=subprocess.STDOUT)
+        wait_for_path(Path("/run/udev/control"), None, 5)
+
+    sync_input_device_nodes()
+    run_checked(["udevadm", "control", "--reload-rules"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run_checked(["udevadm", "trigger", "--action=add", "-s", "input"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run_checked(["udevadm", "settle", "--timeout=5"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    sync_input_device_nodes()
+
+
+def prepare_desktop_filesystem(runtime_dir):
+    if not running_as_root():
+        raise StreamError("desktop-session must run as root so it can prepare /run/user and the persistent home bind mount")
+    ensure_desktop_user()
+
+    for path in (
+        USER_DATA,
+        PERSISTENT_HOME_DIR,
+        LOG_DIR,
+        SUNSHINE_CONFIG_DIR,
+        SUNSHINE_STATE_DIR,
+        runtime_dir,
+        PERSISTENT_HOME_DIR / ".cache",
+        PERSISTENT_HOME_DIR / ".config",
+        PERSISTENT_HOME_DIR / ".local" / "share",
+        PERSISTENT_HOME_DIR / "Desktop",
+        PERSISTENT_HOME_DIR / "Documents",
+        PERSISTENT_HOME_DIR / "Downloads",
+        PERSISTENT_HOME_DIR / "Games",
+        PERSISTENT_HOME_DIR / "Pictures",
+        PERSISTENT_HOME_DIR / "Videos",
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+
+    bind_persistent_home()
+    chown_path(PERSISTENT_HOME_DIR, recursive=True)
+    chown_path(LOG_DIR, recursive=True)
+    chown_path(SUNSHINE_CONFIG_DIR, recursive=True)
+    chown_path(SUNSHINE_STATE_DIR, recursive=True)
+    chown_path(runtime_dir)
+    runtime_dir.chmod(0o700)
+
+    x11_socket_dir = Path("/tmp/.X11-unix")
+    x11_socket_dir.mkdir(parents=True, exist_ok=True)
+    x11_socket_dir.chmod(0o1777)
+
+    for stale in (
+        runtime_dir / DEFAULT_SOCKET,
+        runtime_dir / f"{DEFAULT_SOCKET}.lock",
+        runtime_dir / "bus",
+    ):
+        try:
+            stale.unlink()
+        except FileNotFoundError:
+            pass
+
+    start_udev_stack()
+
+    device_paths = [Path("/dev/uinput"), Path("/dev/uhid")]
+    for pattern in ("card*", "renderD*"):
+        device_paths.extend(Path("/dev/dri").glob(pattern))
+    device_paths.extend(Path("/dev/input").glob("event*"))
+
+    for device_path in device_paths:
+        try:
+            os.chmod(device_path, 0o666)
+        except OSError:
+            pass
+
+
+def write_wayland_desktop_config():
+    config_dir = HOME_DIR / ".config"
+    env_dir = config_dir / "plasma-workspace" / "env"
+    env_dir.mkdir(parents=True, exist_ok=True)
+    DISCONNECT_DESKTOP_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    (config_dir / "ksmserverrc").write_text(
+        "[General]\nconfirmLogout=false\nloginMode=emptySession\n",
+        encoding="utf-8",
+    )
+    (config_dir / "ksplashrc").write_text(
+        "[KSplash]\nEngine=none\n",
+        encoding="utf-8",
+    )
+    (env_dir / "arch-sunshine.sh").write_text(
+        "\n".join(
+            (
+                "export XDG_SESSION_TYPE=wayland",
+                "export XDG_CURRENT_DESKTOP=KDE",
+                "export XDG_SESSION_DESKTOP=KDE",
+                "export XDG_MENU_PREFIX=plasma-",
+                "export DESKTOP_SESSION=plasma",
+                "export KDE_SESSION_VERSION=6",
+                "export KDE_FULL_SESSION=true",
+                "export LC_MESSAGES=en_US.UTF-8",
+                "export LANGUAGE=en_US",
+                "export DISPLAY=${SUNSHINE_XWAYLAND_DISPLAY:-:0}",
+                "export QT_QPA_PLATFORM=wayland",
+                "export SDL_VIDEODRIVER=wayland,x11",
+                "export MOZ_ENABLE_WAYLAND=1",
+                "export GIO_USE_NETWORK_MONITOR=base",
+                "export STEAM_RUNTIME=1",
+                "export SRT_URLOPEN_PREFER_STEAM=1",
+                "export STEAM_DISABLE_AUDIO_DEVICE_SWITCHING=1",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    desktop_entry = "\n".join(
+        (
+            "[Desktop Entry]",
+            "Type=Application",
+            "Name=Disconnect",
+            "Comment=Close the Moonlight stream",
+            "Exec=/usr/local/bin/arch-sunshine disconnect",
+            "Icon=system-log-out",
+            "Terminal=false",
+            "Categories=System;",
+            "StartupNotify=false",
+            "NoDisplay=false",
+            "",
+        )
+    )
+    DISCONNECT_DESKTOP_FILE.write_text(desktop_entry, encoding="utf-8")
+    DISCONNECT_DESKTOP_FILE.chmod(0o644)
+    try:
+        DISCONNECT_DESKTOP_ICON.unlink()
+    except FileNotFoundError:
+        pass
+    cleanup_disconnect_desktop_mapping(config_dir / "plasma-org.kde.plasma.desktop-appletsrc")
+    cleanup_kickoff_launcher_config(config_dir / "plasma-org.kde.plasma.desktop-appletsrc")
+    chown_path(config_dir, recursive=True)
+    chown_path(DISCONNECT_DESKTOP_FILE)
+
+
+def cleanup_disconnect_desktop_mapping(path):
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    filtered = [line for line in lines if DISCONNECT_DESKTOP_ID not in line]
+    if filtered == lines:
+        return
+    path.write_text("\n".join(filtered) + "\n", encoding="utf-8")
+
+
+def cleanup_kickoff_launcher_config(path):
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    fixed = []
+    changed = False
+    for line in lines:
+        if line == "plugin=metadata":
+            fixed.append("plugin=org.kde.plasma.kickoff")
+            changed = True
+        elif line.startswith("primaryActions="):
+            fixed.append("primaryActions=0")
+            changed = True
+        elif line.startswith("systemFavorites="):
+            fixed.append("systemFavorites=")
+            changed = True
+        else:
+            fixed.append(line)
+    if not changed:
+        return
+    path.write_text("\n".join(fixed) + "\n", encoding="utf-8")
+
+
+def env_args(env):
+    return [f"{key}={value}" for key, value in env.items()]
+
+
+def desktop_base_env(runtime_dir, dbus_address=None, wayland_display=None):
+    env = {
+        "HOME": str(HOME_DIR),
+        "USER": DESKTOP_USER,
+        "LOGNAME": DESKTOP_USER,
+        "LANG": "en_US.UTF-8",
+        "LC_CTYPE": "en_US.UTF-8",
+        "LC_MESSAGES": "en_US.UTF-8",
+        "LANGUAGE": "en_US",
+        "XDG_RUNTIME_DIR": str(runtime_dir),
+        "XDG_CONFIG_HOME": str(HOME_DIR / ".config"),
+        "XDG_DATA_HOME": str(HOME_DIR / ".local" / "share"),
+        "XDG_CURRENT_DESKTOP": "KDE",
+        "XDG_MENU_PREFIX": "plasma-",
+        "XDG_SESSION_DESKTOP": "KDE",
+        "XDG_SESSION_TYPE": "wayland",
+        "DESKTOP_SESSION": "plasma",
+        "KDE_SESSION_VERSION": "6",
+        "KDE_FULL_SESSION": "true",
+        "DISPLAY": os.environ.get("SUNSHINE_XWAYLAND_DISPLAY", ":0"),
+        "QT_QPA_PLATFORM": "wayland",
+        "SDL_VIDEODRIVER": "wayland,x11",
+        "MOZ_ENABLE_WAYLAND": "1",
+        "GIO_USE_NETWORK_MONITOR": "base",
+        "RES_OPTIONS": "timeout:1 attempts:2 rotate single-request-reopen",
+        "PULSE_SERVER": f"unix:{runtime_dir}/pulse/native",
+        "STEAM_RUNTIME": "1",
+        "SRT_URLOPEN_PREFER_STEAM": "1",
+        "STEAM_DISABLE_AUDIO_DEVICE_SWITCHING": "1",
+    }
+    kwin_compose = os.environ.get("SUNSHINE_KWIN_COMPOSE", "").strip()
+    if kwin_compose:
+        env["KWIN_COMPOSE"] = kwin_compose
+    if dbus_address:
+        env["DBUS_SESSION_BUS_ADDRESS"] = dbus_address
+    if wayland_display:
+        env["WAYLAND_DISPLAY"] = wayland_display
+    return env
+
+
+def run_as_desktop_user(command, env, **kwargs):
+    return run_checked(
+        ["runuser", "-u", DESKTOP_USER, "--", "env", *env_args(env), *command],
+        **kwargs,
+    )
+
+
+def start_as_desktop_user(command, env, log_name):
+    log_path = LOG_DIR / log_name
+    log_handle = log_path.open("ab", buffering=0)
+    process = subprocess.Popen(
+        ["runuser", "-u", DESKTOP_USER, "--", "env", *env_args(env), *command],
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+    )
+    process._arch_sunshine_log_handle = log_handle
+    return process
+
+
+def run_kwriteconfig(env, file_name, groups, key, value):
+    command = ["kwriteconfig6", "--file", str(HOME_DIR / ".config" / file_name)]
+    for group in groups:
+        command.extend(["--group", group])
+    command.extend(["--key", key, str(value)])
+    run_as_desktop_user(command, env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def update_kwin_output_config(width, height, fps, scale):
+    config_path = HOME_DIR / ".config" / "kwinoutputconfig.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+
+    refresh_rate = int(round(float(fps) * 1000))
+    changed = False
+    for section in config:
+        if section.get("name") != "outputs":
+            continue
+        for output in section.get("data", []):
+            if output.get("connectorName") not in KWIN_OUTPUT_NAMES:
+                continue
+            mode = output.setdefault("mode", {})
+            mode["width"] = int(width)
+            mode["height"] = int(height)
+            mode["refreshRate"] = refresh_rate
+            output["scale"] = scale_value(scale)
+            changed = True
+
+    if not changed:
+        return
+    try:
+        config_path.write_text(json.dumps(config, indent=4) + "\n", encoding="utf-8")
+        chown_path(config_path)
+    except OSError:
+        pass
+
+
+def apply_kde_scale_config(env, width, height, fps, scale, live=False):
+    scale_text = plasma_scale_text(scale)
+    run_kwriteconfig(env, "kdeglobals", ("KScreen",), "ScaleFactor", scale_text)
+    run_kwriteconfig(env, "kdeglobals", ("KScreen",), "ScreenScaleFactors", plasma_screen_scale_factors(scale))
+    run_kwriteconfig(env, "kdeglobals", ("KScreen",), "XwaylandClientsScale", "false")
+    run_kwriteconfig(env, "kdeglobals", ("General",), "Xft.dpi", plasma_scale_dpi(scale))
+    run_kwriteconfig(env, "kwinrc", ("Xwayland",), "Scale", scale_text)
+    update_kwin_output_config(width, height, fps, scale)
+
+    if live and command_available("kscreen-doctor"):
+        for output_name in KWIN_OUTPUT_NAMES:
+            run_as_desktop_user(
+                ["kscreen-doctor", f"output.{output_name}.scale.{scale_text}"],
+                env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+
+def apply_kde_session_tweaks(env):
+    run_kwriteconfig(env, "kded6rc", ("Module-kscreen",), "autoload", "false")
+    for key in ("action/lock_screen", "lock_screen"):
+        run_kwriteconfig(env, "kdeglobals", ("KDE Action Restrictions",), key, "false")
+    kdeglobals = HOME_DIR / ".config" / "kdeglobals"
+    try:
+        text = kdeglobals.read_text(encoding="utf-8")
+        lines = [
+            line
+            for line in text.splitlines()
+            if not line.startswith(("action/logout", "logout"))
+        ]
+        text = "\n".join(lines) + "\n"
+        kdeglobals.write_text(text.replace("[KDE Action Restrictions]\n", "[KDE Action Restrictions][$i]\n"), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def ensure_plasma_launcher_defaults(env):
+    launcher_url = DISCONNECT_DESKTOP_FILE.as_uri()
+    old_desktop_url = DISCONNECT_DESKTOP_ICON.as_uri()
+    taskbar_launchers = (
+        "applications:org.kde.dolphin.desktop",
+        "applications:firefox.desktop",
+        "applications:steam.desktop",
+    )
+    script = "\n".join(
+        (
+            f"var disconnectId = {json.dumps(DISCONNECT_DESKTOP_ID)};",
+            f"var disconnectUrls = [{json.dumps(launcher_url)}, {json.dumps(old_desktop_url)}];",
+            f"var taskbarLaunchers = {json.dumps(taskbar_launchers)};",
+            'var result = {removedPanelIcons: 0, configuredLaunchers: 0, configuredTaskManagers: 0};',
+            "function splitConfig(value) {",
+            "    if (value === undefined || value === null) {",
+            "        return [];",
+            "    }",
+            "    if (Array.isArray(value)) {",
+            '        value = value.join(",");',
+            "    }",
+            "    return String(value).split(/[;,]/).map(function(entry) {",
+            "        return String(entry).trim();",
+            "    }).filter(function(entry) {",
+            "        return entry.length > 0;",
+            "    });",
+            "}",
+            "function isDisconnectValue(value) {",
+            "    value = String(value);",
+            "    return value === disconnectId || value === 'applications:' + disconnectId || value.indexOf(disconnectId) !== -1;",
+            "}",
+            "function withoutDisconnect(values) {",
+            "    var seen = {};",
+            "    var entries = [];",
+            "    values.forEach(function(value) {",
+            "        if (isDisconnectValue(value) || seen[value]) {",
+            "            return;",
+            "        }",
+            "        seen[value] = true;",
+            "        entries.push(value);",
+            "    });",
+            "    return entries;",
+            "}",
+            "function isDisconnectUrl(value) {",
+            "    value = String(value);",
+            "    if (isDisconnectValue(value)) {",
+            "        return true;",
+            "    }",
+            "    return disconnectUrls.indexOf(value) !== -1;",
+            "}",
+            "function configureLauncher(widget) {",
+            "    widget.currentConfigGroup = ['General'];",
+            "    if (widget.type === 'org.kde.plasma.kicker' || widget.type === 'org.kde.plasma.kickerdash') {",
+            "        widget.writeConfig('favoriteApps', withoutDisconnect(splitConfig(widget.readConfig('favoriteApps'))));",
+            "        widget.writeConfig('favoriteSystemActions', []);",
+            "        widget.reloadConfig();",
+            "        result.configuredLaunchers += 1;",
+            "    } else if (widget.type === 'org.kde.plasma.kickoff' || widget.type === 'metadata') {",
+            "        widget.writeConfig('favorites', withoutDisconnect(splitConfig(widget.readConfig('favorites'))));",
+            "        widget.writeConfig('primaryActions', 0);",
+            "        widget.writeConfig('systemFavorites', []);",
+            "        widget.reloadConfig();",
+            "        result.configuredLaunchers += 1;",
+            "    }",
+            "}",
+            "function configureTaskManager(widget) {",
+            "    if (widget.type !== 'org.kde.plasma.icontasks' && widget.type !== 'org.kde.plasma.taskmanager') {",
+            "        return;",
+            "    }",
+            "    widget.currentConfigGroup = ['General'];",
+            "    widget.writeConfig('launchers', taskbarLaunchers.join(','));",
+            "    widget.reloadConfig();",
+            "    result.configuredTaskManagers += 1;",
+            "}",
+            "function visitWidgets(container) {",
+            "    container.widgetIds.forEach(function(widgetId) {",
+            "        var widget = container.widgetById(widgetId);",
+            "        if (!widget) {",
+            "            return;",
+            "        }",
+            "        if (widget.type === 'org.kde.plasma.icon') {",
+            "            widget.currentConfigGroup = ['General'];",
+            "            if (isDisconnectUrl(widget.readConfig('url'))) {",
+            "                widget.remove();",
+            "                result.removedPanelIcons += 1;",
+            "                return;",
+            "            }",
+            "        }",
+            "        configureLauncher(widget);",
+            "        configureTaskManager(widget);",
+            "    });",
+            "}",
+            "panels().forEach(visitWidgets);",
+            "desktops().forEach(visitWidgets);",
+            "print(JSON.stringify(result));",
+            "JSON.stringify(result);",
+        )
+    )
+    output = []
+    deadline = time.monotonic() + 10
+    while True:
+        result = run_as_desktop_user(
+            ["timeout", "2s", "qdbus6", "org.kde.plasmashell", "/PlasmaShell", "evaluateScript", script],
+            env,
+            capture_output=True,
+            text=True,
+        )
+        output.append((result.stdout or "") + (result.stderr or ""))
+        if result.returncode == 0 and "configuredLaunchers" in (result.stdout or ""):
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+    try:
+        (LOG_DIR / "plasma-launchers.log").write_text("\n".join(output), encoding="utf-8")
+    except OSError:
+        return
+
+
+def close_process_log(process):
+    handle = getattr(process, "_arch_sunshine_log_handle", None)
+    if handle:
+        handle.close()
+
+
+def terminate_process(process):
+    if process is None:
+        return
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+    close_process_log(process)
+
+
+def kill_desktop_processes():
+    run_checked(
+        ["pkill", "-TERM", "-u", str(DESKTOP_UID), "-f", "/usr/local/bin/arch-sunshine session-actions"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    for name in (
+        "sunshine",
+        "xdg-desktop-portal",
+        "xdg-desktop-portal-kde",
+        "plasmashell",
+        "kded6",
+        "kactivitymanage",
+        "kactivitymanagerd",
+        "kwin_wayland",
+        "Xwayland",
+        "pipewire-pulse",
+        "wireplumber",
+        "pipewire",
+    ):
+        run_checked(
+            ["pkill", "-TERM", "-u", str(DESKTOP_UID), "-x", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    run_checked(
+        ["pkill", "-TERM", "-u", str(DESKTOP_UID), "-f", "/usr/lib/kactivitymanagerd"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def wait_for_path(path, process, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        if process is not None and process.poll() is not None:
+            return False
+        time.sleep(0.1)
+    return False
+
+
+def process_name_running(name):
+    return run_checked(
+        ["pgrep", "-u", str(DESKTOP_UID), "-x", name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def wait_for_process_name(name, process, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process_name_running(name):
+            return True
+        if process is not None and process.poll() is not None:
+            return False
+        time.sleep(0.1)
+    return False
+
+
+def wait_for_tcp_port(host, port, process, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.25):
+                return True
+        except OSError:
+            pass
+        if process is not None and process.poll() is not None:
+            return False
+        time.sleep(0.25)
+    return False
+
+
+class ControlChannel:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.read_fd = None
+        self.keepalive_fd = None
+        self.buffer = ""
+
+    def open(self):
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+        os.mkfifo(self.path, 0o660)
+        chown_path(self.path)
+        self.read_fd = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
+        self.keepalive_fd = os.open(self.path, os.O_WRONLY | os.O_NONBLOCK)
+        return self
+
+    def close(self):
+        for fd in (self.read_fd, self.keepalive_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.read_fd = None
+        self.keepalive_fd = None
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            pass
+
+    def fileno(self):
+        return self.read_fd
+
+    def read_messages(self):
+        messages = []
+        if self.read_fd is None:
+            return messages
+        while True:
+            try:
+                data = os.read(self.read_fd, 65536)
+            except BlockingIOError:
+                break
+            if not data:
+                break
+            self.buffer += data.decode("utf-8", errors="replace")
+            while "\n" in self.buffer:
+                line, self.buffer = self.buffer.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    messages.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    eprint(f"arch-sunshine: ignored invalid control message: {exc}")
+        return messages
+
+
+def control_fifo_path(runtime_dir=None):
+    return Path(runtime_dir or os.environ.get("XDG_RUNTIME_DIR", str(DEFAULT_RUNTIME_DIR))) / CONTROL_FIFO_NAME
+
+
+def send_control_message(message, runtime_dir=None):
+    path = control_fifo_path(runtime_dir)
+    payload = json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n"
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError as exc:
+        raise StreamError(f"desktop control channel is not ready: {path}") from exc
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
+
+
+def wait_for_dbus_name(name, env, process, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            return False
+        probe = run_as_desktop_user(
+            [
+                "qdbus6",
+                "org.freedesktop.DBus",
+                "/",
+                "org.freedesktop.DBus.NameHasOwner",
+                name,
+            ],
+            env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if probe.returncode == 0 and probe.stdout.strip() == "true":
+            return True
+        time.sleep(0.1)
+    return False
+
+
+class UInputTestDevice:
+    UI_SET_EVBIT = 0x40045564
+    UI_SET_KEYBIT = 0x40045565
+    UI_SET_RELBIT = 0x40045566
+    UI_DEV_CREATE = 0x5501
+    UI_DEV_DESTROY = 0x5502
+
+    EV_SYN = 0
+    EV_KEY = 1
+    EV_REL = 2
+    SYN_REPORT = 0
+    REL_X = 0
+    REL_Y = 1
+    KEY_A = 30
+    KEY_B = 48
+    KEY_C = 46
+    KEY_ENTER = 28
+    KEY_T = 20
+    BTN_LEFT = 272
+    BTN_RIGHT = 273
+    BTN_MIDDLE = 274
+
+    def __init__(self):
+        self.fd = None
+
+    def __enter__(self):
+        import fcntl
+
+        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        for ev_type in (self.EV_KEY, self.EV_REL):
+            fcntl.ioctl(self.fd, self.UI_SET_EVBIT, ev_type)
+        for key_code in (
+            self.KEY_A,
+            self.KEY_B,
+            self.KEY_C,
+            self.KEY_ENTER,
+            self.KEY_T,
+            self.BTN_LEFT,
+            self.BTN_RIGHT,
+            self.BTN_MIDDLE,
+        ):
+            fcntl.ioctl(self.fd, self.UI_SET_KEYBIT, key_code)
+        for rel_code in (self.REL_X, self.REL_Y):
+            fcntl.ioctl(self.fd, self.UI_SET_RELBIT, rel_code)
+
+        user_dev = struct.pack(
+            "80sHHHHI" + "i" * 256,
+            b"Arch Sunshine Input Test\0",
+            0x03,
+            0xCAFE,
+            0x0001,
+            1,
+            0,
+            *([0] * 256),
+        )
+        os.write(self.fd, user_dev)
+        fcntl.ioctl(self.fd, self.UI_DEV_CREATE)
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        if self.fd is None:
+            return
+        import fcntl
+
+        try:
+            fcntl.ioctl(self.fd, self.UI_DEV_DESTROY)
+        except OSError:
+            pass
+        os.close(self.fd)
+        self.fd = None
+
+    def emit(self, event_type, code, value):
+        now = time.time()
+        seconds = int(now)
+        useconds = int((now - seconds) * 1_000_000)
+        os.write(self.fd, struct.pack("llHHi", seconds, useconds, event_type, code, value))
+
+    def sync(self):
+        self.emit(self.EV_SYN, self.SYN_REPORT, 0)
+
+    def move(self, dx, dy):
+        self.emit(self.EV_REL, self.REL_X, dx)
+        self.emit(self.EV_REL, self.REL_Y, dy)
+        self.sync()
+
+    def click_button(self, button):
+        self.emit(self.EV_KEY, button, 1)
+        self.sync()
+        time.sleep(0.05)
+        self.emit(self.EV_KEY, button, 0)
+        self.sync()
+
+    def click_left(self):
+        self.click_button(self.BTN_LEFT)
+
+    def click_middle(self):
+        self.click_button(self.BTN_MIDDLE)
+
+    def click_right(self):
+        self.click_button(self.BTN_RIGHT)
+
+    def type_t(self):
+        self.emit(self.EV_KEY, self.KEY_T, 1)
+        self.sync()
+        time.sleep(0.05)
+        self.emit(self.EV_KEY, self.KEY_T, 0)
+        self.sync()
+
+    def tap_key(self, key_code):
+        self.emit(self.EV_KEY, key_code, 1)
+        self.sync()
+        time.sleep(0.03)
+        self.emit(self.EV_KEY, key_code, 0)
+        self.sync()
+
+    def type_abc_enter(self):
+        for key_code in (self.KEY_A, self.KEY_B, self.KEY_C, self.KEY_ENTER):
+            self.tap_key(key_code)
+            time.sleep(0.03)
+
+
+def read_process_lines(process, timeout, echo=False):
+    lines = []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            break
+        readable, _, _ = select.select([process.stdout], [], [], 0.1)
+        if not readable:
+            continue
+        line = process.stdout.readline()
+        if not line:
+            continue
+        lines.append(line)
+        if echo:
+            print(line, end="")
+    return lines
+
+
+def start_session_bus(runtime_dir):
+    bus_path = runtime_dir / "bus"
+    try:
+        bus_path.unlink()
+    except FileNotFoundError:
+        pass
+
+    result = run_as_desktop_user(
+        [
+            "dbus-daemon",
+            "--session",
+            "--fork",
+            f"--address=unix:path={bus_path}",
+            "--print-address",
+            "--print-pid",
+        ],
+        desktop_base_env(runtime_dir),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise StreamError(f"failed to start session D-Bus: {result.stderr.strip()}")
+
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(lines) < 2:
+        raise StreamError("session D-Bus did not report its address and pid")
+
+    if not wait_for_path(bus_path, None, 5):
+        raise StreamError(f"timed out waiting for session D-Bus socket: {bus_path}")
+
+    return lines[0], lines[1]
+
+
+def start_system_bus():
+    Path("/run/dbus").mkdir(parents=True, exist_ok=True)
+    Path("/var/lib/dbus").mkdir(parents=True, exist_ok=True)
+    machine_id = Path("/var/lib/dbus/machine-id")
+    if not machine_id.exists() and Path("/etc/machine-id").exists():
+        shutil.copyfile("/etc/machine-id", machine_id)
+    socket_path = Path("/run/dbus/system_bus_socket")
+    if socket_path.exists():
+        return ""
+    result = run_checked(
+        ["dbus-daemon", "--system", "--fork", "--print-pid"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise StreamError(f"failed to start system D-Bus: {result.stderr.strip()}")
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        raise StreamError("system D-Bus did not report its pid")
+    return lines[-1]
+
+
+def start_network_status():
+    if not Path("/usr/local/bin/arch-sunshine-network-status").exists():
+        return None
+    log_path = LOG_DIR / "network-status.log"
+    log_handle = log_path.open("ab", buffering=0)
+    process = subprocess.Popen(
+        ["/usr/local/bin/arch-sunshine-network-status"],
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+    )
+    process._arch_sunshine_log_handle = log_handle
+    return process
+
+
+def start_pipewire_stack(runtime_dir, env):
+    pipewire = start_as_desktop_user(["pipewire"], env, "pipewire.log")
+    if not wait_for_path(runtime_dir / "pipewire-0", pipewire, 5):
+        terminate_process(pipewire)
+        raise StreamError("timed out waiting for PipeWire")
+
+    wireplumber = start_as_desktop_user(["wireplumber"], env, "wireplumber.log")
+    pulse = start_as_desktop_user(["pipewire-pulse"], env, "pipewire-pulse.log")
+    if not wait_for_path(runtime_dir / "pulse" / "native", pulse, 5):
+        terminate_process(pulse)
+        terminate_process(wireplumber)
+        terminate_process(pipewire)
+        raise StreamError("timed out waiting for PipeWire Pulse")
+
+    ensure_audio_sink(env)
+    return [pipewire, wireplumber, pulse]
+
+
+def start_portal_stack(env):
+    backend = start_as_desktop_user(["/usr/lib/xdg-desktop-portal-kde"], env, "xdg-desktop-portal-kde.log")
+    portal = start_as_desktop_user(["/usr/lib/xdg-desktop-portal"], env, "xdg-desktop-portal.log")
+    return [backend, portal]
+
+
+def ensure_audio_sink(env):
+    found_sink = False
+    result = run_as_desktop_user(
+        ["pactl", "list", "short", "sinks"],
+        env,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        names = [line.split()[1] for line in result.stdout.splitlines() if len(line.split()) > 1]
+        if "arch_sunshine_audio" in names:
+            found_sink = True
+
+    if not found_sink:
+        with (LOG_DIR / "audio-sink.log").open("ab") as log_handle:
+            result = run_as_desktop_user(
+                [
+                    "pactl",
+                    "load-module",
+                    "module-null-sink",
+                    "sink_name=arch_sunshine_audio",
+                    "sink_properties=device.description=Arch_Stream_Audio",
+                ],
+                env,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+            )
+        if result.returncode != 0:
+            raise StreamError("failed to create arch_sunshine_audio PipeWire sink")
+
+    run_as_desktop_user(
+        ["pactl", "set-default-sink", "arch_sunshine_audio"],
+        env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    run_as_desktop_user(
+        ["pactl", "set-default-source", "arch_sunshine_audio.monitor"],
+        env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def process_status(process):
+    if process is not None and process.poll() is None:
+        return "running"
+    return "stopped"
+
+
+def path_status(path):
+    return "ready" if Path(path).exists() else "missing"
+
+
+def chosen_encoder_summary():
+    try:
+        config = load_config(DEFAULT_CONFIG)
+    except StreamError as exc:
+        return [f"config unavailable: {exc}"]
+
+    lines = []
+    for codec in ("h264", "hevc", "av1"):
+        try:
+            lines.append(f"{codec.upper():4} {choose_encoder(config, codec)['name']}")
+        except StreamError as exc:
+            lines.append(f"{codec.upper():4} unavailable ({exc})")
+    return lines
+
+
+def audio_status(env):
+    result = run_as_desktop_user(
+        ["pactl", "list", "short", "sinks"],
+        env,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return "unavailable"
+
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) > 1 and parts[1] == "arch_sunshine_audio":
+            return "arch_sunshine_audio"
+    return "missing arch_sunshine_audio"
+
+
+def render_nodes_summary():
+    nodes = sorted(Path("/dev/dri").glob("renderD*"))
+    if nodes:
+        return " ".join(str(node) for node in nodes)
+    return "none"
+
+
+def clear_screen():
+    print("\033[2J\033[H", end="", flush=True)
+
+
+def wait_for_key():
+    print("\nPress any key to return.", end="", flush=True)
+    sys.stdin.read(1)
+
+
+def show_log_tail(title, paths):
+    clear_screen()
+    print(title)
+    print("=" * len(title))
+    for path in paths:
+        path = Path(path)
+        print(f"\n{path}")
+        if path.exists():
+            subprocess.run(["tail", "-n", "35", str(path)], check=False)
+        else:
+            print("Log file does not exist yet.")
+    wait_for_key()
+
+
+def show_command_output(title, command):
+    clear_screen()
+    print(title)
+    print("=" * len(title))
+    print()
+    subprocess.run(command, check=False)
+    wait_for_key()
+
+
+def open_desktop_shell(env):
+    clear_screen()
+    print(f"Container shell as {DESKTOP_USER}. Type exit to return.\n")
+    run_as_desktop_user(["/bin/bash"], env)
+
+
+def stage_pairing_pin():
+    clear_screen()
+    print("Moonlight Pairing")
+    print("=================")
+    print()
+    pin = input("Enter the 4-digit PIN shown by Moonlight: ").strip()
+    result = subprocess.run(["/usr/local/bin/arch-sunshine-server", "pin", pin], check=False)
+    if result.returncode != 0:
+        print("\nPIN was not staged.")
+    wait_for_key()
+
+
+def draw_desktop_ui(_args, runtime_dir, socket_path, desktop_env, state):
+    logical_width, logical_height = kwin_virtual_geometry(state["width"], state["height"], state["scale"])
+    clear_screen()
+    print("Arch Sunshine")
+    print("=============")
+    print()
+    print("Status")
+    print(f"  Desktop    kwin {process_status(state.get('kwin'))} / plasmashell {process_status(state.get('plasmashell'))}")
+    print(f"  Moonlight  Sunshine {process_status(state.get('sunshine'))} / input {process_status(state.get('input_bridge'))}")
+    print(f"  Wayland    {path_status(socket_path)}  {socket_path}")
+    print(f"  PipeWire   {path_status(runtime_dir / 'pipewire-0')}")
+    print(f"  Pulse      {path_status(runtime_dir / 'pulse' / 'native')}  sink {audio_status(desktop_env)}")
+    print(f"  GPU        {render_nodes_summary()}")
+    print(f"  Stream     {state['width']}x{state['height']}@{state['fps']} scale {state['scale']}")
+    print(f"  KWin       {logical_width}x{logical_height} logical")
+    print(f"  Data       {USER_DATA}")
+    print()
+    print("Encoders")
+    for line in chosen_encoder_summary():
+        print(f"  {line}")
+    print()
+    print("Logs")
+    print(f"  KWin       {LOG_DIR / 'kwin-wayland.log'}")
+    print(f"  Plasma     {LOG_DIR / 'plasmashell.log'}")
+    print(f"  Sunshine   {LOG_DIR / 'sunshine.log'}")
+    print(f"  Input      {LOG_DIR / 'input-bridge.log'}")
+    print(f"  PipeWire   {LOG_DIR / 'pipewire.log'}")
+    print(f"  Pulse      {LOG_DIR / 'pipewire-pulse.log'}")
+    print()
+    print("Commands")
+    print("  p  show full encoder probe")
+    print("  h  print H.264 RTP pipeline")
+    print("  e  print HEVC RTP pipeline")
+    print("  a  print AV1 RTP pipeline")
+    print("  r  enter Moonlight pairing PIN")
+    print("  l  show log tails")
+    print(f"  s  open shell as {DESKTOP_USER}")
+    print("  q  quit and stop desktop")
+    print()
+    print("Waiting for command... ", end="", flush=True)
+
+
+def check_session_processes(state):
+    kwin = state.get("kwin")
+    plasmashell = state.get("plasmashell")
+    sunshine = state.get("sunshine")
+    input_bridge = state.get("input_bridge")
+    session_actions = state.get("session_actions")
+    if kwin is not None and kwin.poll() is not None:
+        raise StreamError(f"kwin_wayland exited with status {kwin.returncode}")
+    if plasmashell is not None and plasmashell.poll() is not None:
+        raise StreamError(f"plasmashell exited with status {plasmashell.returncode}")
+    if sunshine is not None and sunshine.poll() is not None:
+        raise StreamError(f"Sunshine exited with status {sunshine.returncode}")
+    if input_bridge is not None and input_bridge.poll() is not None:
+        raise StreamError(f"input bridge exited with status {input_bridge.returncode}")
+    if session_actions is not None and session_actions.poll() is not None:
+        raise StreamError(f"session action service exited with status {session_actions.returncode}")
+
+
+def build_kwin_command(args, width, height, scale):
+    logical_width, logical_height = kwin_virtual_geometry(width, height, scale)
+    command = [
+        "kwin_wayland",
+        "--virtual",
+        "--width",
+        str(logical_width),
+        "--height",
+        str(logical_height),
+        "--scale",
+        str(scale),
+        "--socket",
+        args.socket,
+        "--no-lockscreen",
+    ]
+    if args.xwayland:
+        command.append("--xwayland")
+    return command
+
+
+def remember_process(state, key, process):
+    state["processes"].append(process)
+    state[key] = process
+    return process
+
+
+def stop_desktop_stack(state):
+    for key in ("input_bridge", "portal", "plasmashell", "activities", "kded", "kwin"):
+        value = state.get(key)
+        if isinstance(value, list):
+            for process in reversed(value):
+                terminate_process(process)
+        else:
+            terminate_process(value)
+        state[key] = [] if isinstance(value, list) else None
+
+
+def start_desktop_stack(args, runtime_dir, socket_path, compositor_env, desktop_env, state):
+    for stale in (socket_path, runtime_dir / f"{args.socket}.lock"):
+        try:
+            stale.unlink()
+        except FileNotFoundError:
+            pass
+
+    apply_kde_scale_config(desktop_env, state["width"], state["height"], state["fps"], state["scale"])
+    kwin = remember_process(
+        state,
+        "kwin",
+        start_as_desktop_user(
+            build_kwin_command(args, state["width"], state["height"], state["scale"]),
+            compositor_env,
+            "kwin-wayland.log",
+        ),
+    )
+    if not wait_for_path(socket_path, kwin, args.ready_timeout):
+        raise StreamError(f"timed out waiting for KWin Wayland socket: {socket_path}")
+
+    apply_kde_scale_config(desktop_env, state["width"], state["height"], state["fps"], state["scale"], live=True)
+    run_as_desktop_user(["xdg-user-dirs-update"], desktop_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    apply_kde_session_tweaks(desktop_env)
+    with (LOG_DIR / "kbuildsycoca.log").open("ab") as log_handle:
+        run_as_desktop_user(["kbuildsycoca6", "--noincremental"], desktop_env, stdout=log_handle, stderr=subprocess.STDOUT)
+
+    remember_process(state, "kded", start_as_desktop_user(["kded6"], desktop_env, "kded6.log"))
+    activities_command = kactivitymanagerd_command()
+    if activities_command:
+        activities = remember_process(
+            state,
+            "activities",
+            start_as_desktop_user(activities_command, desktop_env, "kactivitymanagerd.log"),
+        )
+        if not wait_for_dbus_name("org.kde.ActivityManager", desktop_env, activities, args.ready_timeout):
+            raise StreamError("timed out waiting for kactivitymanagerd")
+
+    plasmashell = remember_process(
+        state,
+        "plasmashell",
+        start_as_desktop_user(["plasmashell", "--no-respawn"], desktop_env, "plasmashell.log"),
+    )
+    if not wait_for_process_name("plasmashell", plasmashell, args.ready_timeout):
+        raise StreamError("timed out waiting for plasmashell")
+    ensure_plasma_launcher_defaults(desktop_env)
+
+    portals = start_portal_stack(desktop_env)
+    state["processes"].extend(portals)
+    state["portal"] = portals
+
+
+def start_input_bridge_if_needed(args, desktop_env, state):
+    if args.no_input_bridge or state.get("sunshine") is None:
+        return
+    input_bridge = start_as_desktop_user(
+        ["/usr/local/bin/arch-sunshine-input-bridge"],
+        desktop_env,
+        "input-bridge.log",
+    )
+    remember_process(state, "input_bridge", input_bridge)
+
+
+def restart_desktop_geometry(args, runtime_dir, socket_path, compositor_env, desktop_env, state, width, height, fps, scale, reason):
+    if (
+        state.get("kwin") is not None
+        and state["kwin"].poll() is None
+        and state["width"] == width
+        and state["height"] == height
+        and str(state["scale"]) == str(scale)
+    ):
+        state["fps"] = fps
+        return
+    logical_width, logical_height = kwin_virtual_geometry(width, height, scale)
+    eprint(
+        f"arch-sunshine: {reason}; switching stream to {width}x{height}@{fps} "
+        f"scale {scale} (KWin {logical_width}x{logical_height} logical)"
+    )
+    stop_desktop_stack(state)
+    state.update({"width": width, "height": height, "fps": fps, "scale": scale})
+    start_desktop_stack(args, runtime_dir, socket_path, compositor_env, desktop_env, state)
+    start_input_bridge_if_needed(args, desktop_env, state)
+
+
+def handle_control_messages(args, runtime_dir, socket_path, compositor_env, desktop_env, state, control):
+    for message in control.read_messages():
+        command = message.get("command")
+        if command == "client-start":
+            restart_desktop_geometry(
+                args,
+                runtime_dir,
+                socket_path,
+                compositor_env,
+                desktop_env,
+                state,
+                int(message["width"]),
+                int(message["height"]),
+                str(message["fps"]),
+                str(message["scale"]),
+                "Moonlight client requested geometry",
+            )
+            ack_path = message.get("ack")
+            if ack_path:
+                try:
+                    Path(ack_path).write_text("ok\n", encoding="utf-8")
+                    chown_path(Path(ack_path))
+                except OSError:
+                    pass
+        elif command == "client-stop":
+            width, height, fps, scale = default_geometry()
+            restart_desktop_geometry(
+                args,
+                runtime_dir,
+                socket_path,
+                compositor_env,
+                desktop_env,
+                state,
+                width,
+                height,
+                fps,
+                scale,
+                "Moonlight client disconnected",
+            )
+
+
+def run_desktop_ui_loop(args, runtime_dir, socket_path, desktop_env, compositor_env, state, control):
+    fd = sys.stdin.fileno()
+    original_tty = termios.tcgetattr(fd)
+    tty.setcbreak(fd)
+    try:
+        while True:
+            check_session_processes(state)
+            draw_desktop_ui(args, runtime_dir, socket_path, desktop_env, state)
+            readable, _, _ = select.select([sys.stdin, control], [], [], 1)
+            if not readable:
+                continue
+            if control in readable:
+                handle_control_messages(args, runtime_dir, socket_path, compositor_env, desktop_env, state, control)
+                continue
+
+            key = sys.stdin.read(1).lower()
+            if key == "q":
+                print("\nStopping Arch Sunshine.")
+                return
+            if key == "p":
+                show_command_output("Encoder Probe", ["/usr/local/bin/arch-sunshine", "probe"])
+            elif key == "h":
+                show_command_output("H.264 RTP Pipeline", ["/usr/local/bin/arch-sunshine", "pipeline", "--codec", "h264"])
+            elif key == "e":
+                show_command_output("HEVC RTP Pipeline", ["/usr/local/bin/arch-sunshine", "pipeline", "--codec", "hevc"])
+            elif key == "a":
+                show_command_output("AV1 RTP Pipeline", ["/usr/local/bin/arch-sunshine", "pipeline", "--codec", "av1"])
+            elif key == "r":
+                termios.tcsetattr(fd, termios.TCSADRAIN, original_tty)
+                try:
+                    stage_pairing_pin()
+                finally:
+                    tty.setcbreak(fd)
+            elif key == "l":
+                show_log_tail(
+                    "Arch Sunshine Logs",
+                    (
+                        LOG_DIR / "sunshine.log",
+                        LOG_DIR / "sunshine-wrapper.log",
+                        LOG_DIR / "input-bridge.log",
+                        LOG_DIR / "kwin-wayland.log",
+                        LOG_DIR / "plasmashell.log",
+                        LOG_DIR / "pipewire.log",
+                        LOG_DIR / "pipewire-pulse.log",
+                    ),
+                )
+            elif key == "s":
+                termios.tcsetattr(fd, termios.TCSADRAIN, original_tty)
+                try:
+                    open_desktop_shell(desktop_env)
+                finally:
+                    tty.setcbreak(fd)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original_tty)
+
+
+def command_desktop_session(args):
+    runtime_dir = Path(args.runtime_dir)
+    socket_path = runtime_dir / args.socket
+    width = sanitize_positive_int(args.width, DEFAULT_WIDTH, 8192)
+    height = sanitize_positive_int(args.height, DEFAULT_HEIGHT, 8192)
+    fps = sanitize_refresh_rate(args.fps, DEFAULT_FPS)
+    scale = resolve_session_scale(width, height, args.scale)
+    state = {
+        "processes": [],
+        "kwin": None,
+        "kded": None,
+        "activities": None,
+        "plasmashell": None,
+        "portal": [],
+        "sunshine": None,
+        "input_bridge": None,
+        "session_actions": None,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "scale": scale,
+    }
+    control = None
+    dbus_pid = ""
+    system_dbus_pid = ""
+
+    try:
+        prepare_desktop_filesystem(runtime_dir)
+        start_input_device_node_watcher()
+        write_wayland_desktop_config()
+        kill_desktop_processes()
+        for stale in (socket_path, runtime_dir / f"{args.socket}.lock", control_fifo_path(runtime_dir)):
+            try:
+                stale.unlink()
+            except FileNotFoundError:
+                pass
+
+        dbus_address, dbus_pid = start_session_bus(runtime_dir)
+        system_dbus_pid = start_system_bus()
+        compositor_env = desktop_base_env(runtime_dir, dbus_address)
+        desktop_env = desktop_base_env(runtime_dir, dbus_address, args.socket)
+        control = ControlChannel(control_fifo_path(runtime_dir)).open()
+        network_status = start_network_status()
+        if network_status is not None:
+            remember_process(state, "network_status", network_status)
+        session_actions = start_as_desktop_user(
+            ["/usr/local/bin/arch-sunshine", "session-actions"],
+            desktop_env,
+            "session-actions.log",
+        )
+        remember_process(state, "session_actions", session_actions)
+        if not wait_for_dbus_name("org.kde.Shutdown", desktop_env, session_actions, args.ready_timeout):
+            raise StreamError("timed out waiting for session action service")
+        if not wait_for_dbus_name("org.kde.LogoutPrompt", desktop_env, session_actions, args.ready_timeout):
+            raise StreamError("timed out waiting for logout prompt service")
+
+        if not args.no_audio:
+            state["processes"].extend(start_pipewire_stack(runtime_dir, desktop_env))
+
+        start_desktop_stack(args, runtime_dir, socket_path, compositor_env, desktop_env, state)
+
+        if not args.no_sunshine:
+            sunshine = start_as_desktop_user(
+                ["/usr/local/bin/arch-sunshine-server", "serve"],
+                desktop_env,
+                "sunshine-wrapper.log",
+            )
+            remember_process(state, "sunshine", sunshine)
+            if not wait_for_tcp_port("127.0.0.1", 47989, sunshine, args.ready_timeout):
+                raise StreamError("timed out waiting for Sunshine on TCP port 47989")
+            start_input_bridge_if_needed(args, desktop_env, state)
+
+        eprint(f"arch-sunshine: Plasma Wayland desktop ready on {socket_path}")
+        if args.smoke_seconds > 0:
+            time.sleep(args.smoke_seconds)
+            return 0
+
+        if sys.stdin.isatty():
+            run_desktop_ui_loop(args, runtime_dir, socket_path, desktop_env, compositor_env, state, control)
+            return 0
+
+        stopping = {"value": False}
+
+        def stop(_signum=None, _frame=None):
+            stopping["value"] = True
+
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+
+        while not stopping["value"]:
+            check_session_processes(state)
+            readable, _, _ = select.select([control], [], [], 1)
+            if control in readable:
+                handle_control_messages(args, runtime_dir, socket_path, compositor_env, desktop_env, state, control)
+    finally:
+        if control is not None:
+            control.close()
+        for process in reversed(state["processes"]):
+            terminate_process(process)
+        if dbus_pid:
+            run_checked(["kill", dbus_pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if system_dbus_pid:
+            run_checked(["kill", system_dbus_pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        kill_desktop_processes()
+
+
+def gst_element_exists(name):
+    if name in ELEMENT_CACHE:
+        return ELEMENT_CACHE[name]
+    if not command_available("gst-inspect-1.0"):
+        ELEMENT_CACHE[name] = False
+        return False
+    try:
+        exists = subprocess.run(
+            ["gst-inspect-1.0", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=3,
+        ).returncode == 0
+    except subprocess.TimeoutExpired:
+        exists = False
+    ELEMENT_CACHE[name] = exists
+    return exists
+
+
+def encoder_status(config):
+    status = {}
+    for codec, encoders in config["encoders"].items():
+        codec_status = []
+        for encoder in encoders:
+            missing = [
+                element
+                for element in encoder.get("elements", [])
+                if not gst_element_exists(element)
+            ]
+            codec_status.append(
+                {
+                    "name": encoder["name"],
+                    "usable": not missing,
+                    "missing_elements": missing,
+                }
+            )
+        status[codec] = codec_status
+    return status
+
+
+def choose_encoder(config, codec, requested_name=None):
+    encoders = config["encoders"].get(codec)
+    if not encoders:
+        raise StreamError(f"unsupported codec: {codec}")
+
+    if requested_name:
+        encoders = [encoder for encoder in encoders if encoder["name"] == requested_name]
+        if not encoders:
+            raise StreamError(f"encoder {requested_name!r} is not configured for {codec}")
+
+    for encoder in encoders:
+        missing = [
+            element
+            for element in encoder.get("elements", [])
+            if not gst_element_exists(element)
+        ]
+        if not missing:
+            return encoder
+
+    details = ", ".join(
+        f"{encoder['name']} missing {','.join(element for element in encoder.get('elements', []) if not gst_element_exists(element))}"
+        for encoder in encoders
+    )
+    raise StreamError(f"no usable {codec} encoder found: {details}")
+
+
+def render_template(template, values):
+    return template.format(**values)
+
+
+def build_pipeline(args, config):
+    encoder = choose_encoder(config, args.codec, args.encoder)
+    defaults = dict(config.get("defaults", {}))
+    values = {
+        "width": args.width,
+        "height": args.height,
+        "fps": args.fps,
+        "bitrate_kbps": args.bitrate,
+        "vbv_buffer_kbits": args.vbv_buffer,
+        "payload_mtu": args.payload_mtu,
+        "pipewire_node": args.pipewire_node,
+    }
+    for key, value in defaults.items():
+        values.setdefault(key, value)
+
+    try:
+        source_template = config["video_sources"][args.source]
+    except KeyError as exc:
+        raise StreamError(f"unknown source {args.source!r}") from exc
+
+    try:
+        payloader_template = config["payloader"][args.codec]
+    except KeyError as exc:
+        raise StreamError(f"missing payloader for {args.codec}") from exc
+
+    source = render_template(source_template, values)
+    encode = render_template(encoder["pipeline"], values)
+    payloader = render_template(payloader_template, values)
+
+    pipeline = (
+        f"{source} ! queue max-size-buffers=2 leaky=downstream ! "
+        f"{encode} ! {payloader} ! "
+        f"queue max-size-buffers=2 leaky=downstream ! "
+        f"udpsink host={args.host} port={args.port} sync=false async=false"
+    )
+    return encoder["name"], pipeline
+
+
+def command_probe(args):
+    config = load_config(args.config)
+    result = {
+        "gst_launch": command_available("gst-launch-1.0"),
+        "gst_inspect": command_available("gst-inspect-1.0"),
+        "weston": command_available("weston"),
+        "encoders": encoder_status(config),
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def command_pipeline(args):
+    config = load_config(args.config)
+    encoder_name, pipeline = build_pipeline(args, config)
+    if args.json:
+        print(json.dumps({"encoder": encoder_name, "pipeline": pipeline}, indent=2))
+    else:
+        print(pipeline)
+
+
+def command_stream_test(args):
+    if not command_available("gst-launch-1.0"):
+        raise StreamError("gst-launch-1.0 is not installed")
+
+    config = load_config(args.config)
+    encoder_name, pipeline = build_pipeline(args, config)
+    eprint(f"arch-sunshine: using encoder {encoder_name}")
+    eprint(f"arch-sunshine: udp target {args.host}:{args.port}")
+    eprint(f"arch-sunshine: pipeline {pipeline}")
+    os.execvp("gst-launch-1.0", ["gst-launch-1.0", "-e", *shlex.split(pipeline)])
+
+
+def wait_for_socket(path, process, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        if process.poll() is not None:
+            raise StreamError(f"weston exited early with status {process.returncode}")
+        time.sleep(0.1)
+    raise StreamError(f"timed out waiting for Wayland socket: {path}")
+
+
+def command_wayland_session(args):
+    if not command_available("weston"):
+        raise StreamError("weston is not installed")
+
+    runtime_dir = Path(args.runtime_dir)
+    runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    socket_path = runtime_dir / args.socket
+    lock_path = runtime_dir / f"{args.socket}.lock"
+    for path in (socket_path, lock_path):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+    env = os.environ.copy()
+    env["XDG_RUNTIME_DIR"] = str(runtime_dir)
+    weston_cmd = [
+        "weston",
+        "--backend=headless-backend.so",
+        "--renderer=gl",
+        f"--width={args.width}",
+        f"--height={args.height}",
+        f"--socket={args.socket}",
+        "--idle-time=0",
+    ]
+    eprint("arch-sunshine: starting bootstrap Wayland compositor")
+    weston = subprocess.Popen(weston_cmd, env=env)
+
+    def stop_weston(_signum=None, _frame=None):
+        if weston.poll() is None:
+            weston.terminate()
+            try:
+                weston.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                weston.kill()
+
+    signal.signal(signal.SIGTERM, stop_weston)
+    signal.signal(signal.SIGINT, stop_weston)
+
+    try:
+        wait_for_socket(socket_path, weston)
+        app_env = env.copy()
+        app_env["WAYLAND_DISPLAY"] = args.socket
+        app_env["XDG_SESSION_TYPE"] = "wayland"
+        app_env["SDL_VIDEODRIVER"] = "wayland"
+        app_env["QT_QPA_PLATFORM"] = "wayland"
+        app_env["MOZ_ENABLE_WAYLAND"] = "1"
+        eprint(f"arch-sunshine: Wayland display ready at {socket_path}")
+        return subprocess.call(args.app_command, env=app_env)
+    finally:
+        stop_weston()
+
+
+def command_input_test(args):
+    if not running_as_root():
+        raise StreamError("input-test must run as root so it can create a temporary uinput device")
+    if not command_available("foot"):
+        raise StreamError("foot is required for input-test")
+
+    runtime_dir = Path(args.runtime_dir)
+    socket_path = runtime_dir / args.socket
+    if not socket_path.exists():
+        raise StreamError(f"Wayland socket not found: {socket_path}; start desktop-session first")
+
+    start_udev_stack()
+    start_input_device_node_watcher()
+
+    env = desktop_base_env(runtime_dir, f"unix:path={runtime_dir / 'bus'}", args.socket)
+    bridge = None
+    keyboard_output = Path("/tmp/arch-sunshine-input-test-keyboard.txt")
+    mouse_output = Path("/tmp/arch-sunshine-input-test-mouse.bin")
+    for output in (keyboard_output, mouse_output):
+        try:
+            output.unlink()
+        except FileNotFoundError:
+            pass
+
+    bridge_probe = run_checked(
+        ["pgrep", "-u", str(DESKTOP_UID), "-f", "arch-sunshine-input-bridge"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if bridge_probe.returncode != 0:
+        bridge = start_as_desktop_user(
+            ["/usr/local/bin/arch-sunshine-input-bridge", "--exit-on-error"],
+            env,
+            "input-bridge-test.log",
+        )
+        time.sleep(1.0)
+
+    try:
+        keyboard_command = [
+            "foot",
+            "--fullscreen",
+            "sh",
+            "-lc",
+            f"IFS= read -r line; printf '%s' \"$line\" > {keyboard_output}; sleep 1",
+        ]
+        keyboard_process = subprocess.Popen(
+            ["runuser", "-u", DESKTOP_USER, "--", "env", *env_args(env), *keyboard_command],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(args.warmup_seconds)
+
+        with UInputTestDevice() as device:
+            time.sleep(0.5)
+            sync_input_device_nodes()
+            run_checked(["udevadm", "trigger", "--action=add", "-s", "input"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            run_checked(["udevadm", "settle", "--timeout=2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            sync_input_device_nodes()
+            time.sleep(args.hotplug_seconds)
+
+            device.type_abc_enter()
+
+        deadline = time.monotonic() + args.timeout
+        while time.monotonic() < deadline and not keyboard_output.exists():
+            time.sleep(0.1)
+        keyboard_text = keyboard_output.read_text(encoding="utf-8") if keyboard_output.exists() else ""
+        saw_key = keyboard_text == "abc"
+
+        terminate_process(keyboard_process)
+
+        mouse_script = (
+            "python3 -c '"
+            "import os,select,sys,termios,time,tty;"
+            "out=\"/tmp/arch-sunshine-input-test-mouse.bin\";"
+            "fd=sys.stdin.fileno(); old=termios.tcgetattr(fd);"
+            "sys.stdout.write(\"\\033[?1000h\\033[?1003h\\033[?1006h\"); sys.stdout.flush();"
+            "tty.setraw(fd); data=b\"\"; end=time.time()+6;"
+            "\nwhile time.time()<end:\n"
+            " r,_,_=select.select([fd],[],[],0.1)\n"
+            " if r:\n"
+            "  data+=os.read(fd,4096)\n"
+            "termios.tcsetattr(fd, termios.TCSADRAIN, old);"
+            "open(out,\"wb\").write(data)'"
+        )
+        mouse_process = subprocess.Popen(
+            [
+                "runuser",
+                "-u",
+                DESKTOP_USER,
+                "--",
+                "env",
+                *env_args(env),
+                "foot",
+                "--fullscreen",
+                "sh",
+                "-lc",
+                mouse_script,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(args.warmup_seconds)
+        with UInputTestDevice() as device:
+            time.sleep(0.5)
+            sync_input_device_nodes()
+            run_checked(["udevadm", "trigger", "--action=add", "-s", "input"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            run_checked(["udevadm", "settle", "--timeout=2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            sync_input_device_nodes()
+            time.sleep(args.hotplug_seconds)
+            for dx, dy in ((120, 120), (-60, -60), (20, 20)):
+                device.move(dx, dy)
+                time.sleep(0.1)
+            device.click_left()
+            time.sleep(0.1)
+            device.click_middle()
+            time.sleep(0.1)
+            device.click_right()
+
+        mouse_process.wait(timeout=args.timeout + 2)
+        mouse_bytes = mouse_output.read_bytes() if mouse_output.exists() else b""
+        saw_left = b"\x1b[<0;" in mouse_bytes
+        saw_middle = b"\x1b[<1;" in mouse_bytes
+        saw_right = b"\x1b[<2;" in mouse_bytes
+        saw_button = saw_left and saw_middle and saw_right
+        saw_motion = b"\x1b[<35;" in mouse_bytes or b"\x1b[<32;" in mouse_bytes
+
+        print(f"input-test: motion={saw_motion} buttons=left:{saw_left},middle:{saw_middle},right:{saw_right} key={saw_key}")
+        if not saw_motion:
+            print("input-test: no pointer motion reached the focused terminal probe")
+        if not saw_button:
+            print("input-test: not all primary pointer buttons reached the focused terminal probe")
+        if not saw_key:
+            print(f"input-test: keyboard probe read {keyboard_text!r}, expected 'abc'")
+        if args.verbose and mouse_bytes:
+            print(f"input-test: mouse bytes {mouse_bytes!r}")
+
+        if args.require_all and not (saw_motion and saw_button and saw_key):
+            raise StreamError("input-test failed: bridged input events did not reach the Wayland clients")
+        if not (saw_motion or saw_button or saw_key):
+            raise StreamError("input-test failed: no bridged input events reached the Wayland clients")
         return 0
-      fi
-    else
-      printf '%s\n' "${output}" >"${LOG_DIR}/panel-launchers.log"
-    fi
-    sleep 0.2
-  done
-}
+    finally:
+        if bridge is not None:
+            terminate_process(bridge)
 
-write_xorg_config() {
-  local driver="${1:-${DISPLAY_DRIVER}}"
-  local mode_line
-  local mode_name
 
-  ACTIVE_DISPLAY_DRIVER="${driver}"
-  write_desktop_env
-  mode_name="$(xrandr_mode_name)"
-  mode_line="$(cvt "${WIDTH}" "${HEIGHT}" "${REFRESH_RATE}" | awk '/Modeline/ {sub(/^Modeline /, ""); print}')"
-  if [ -z "${mode_line}" ]; then
-    mode_line="\"${mode_name}\" 173.00 ${WIDTH} $((WIDTH + 2048)) $((WIDTH + 2248)) $((WIDTH + 2576)) ${HEIGHT} $((HEIGHT + 3)) $((HEIGHT + 8)) $((HEIGHT + 38)) -hsync +vsync"
-  fi
+def command_client_start(_args):
+    width, height, fps, scale = requested_client_geometry()
+    ack_path = control_fifo_path().with_name(f"arch-sunshine-client-start-{os.getpid()}.done")
+    try:
+        ack_path.unlink()
+    except FileNotFoundError:
+        pass
+    send_control_message(
+        {
+            "command": "client-start",
+            "width": width,
+            "height": height,
+            "fps": fps,
+            "scale": scale,
+            "ack": str(ack_path),
+        }
+    )
+    deadline = time.monotonic() + float(os.environ.get("SUNSHINE_CLIENT_READY_TIMEOUT", "30"))
+    while time.monotonic() < deadline:
+        if ack_path.exists():
+            try:
+                ack_path.unlink()
+            except FileNotFoundError:
+                pass
+            return 0
+        time.sleep(0.1)
+    raise StreamError("timed out waiting for desktop resize")
 
-  if [ "${driver}" = "modesetting" ]; then
-    cat > "${XORG_CONFIG}" <<EOF
-Section "ServerFlags"
-    Option "AutoAddDevices" "true"
-    Option "DontVTSwitch" "true"
-    Option "AllowMouseOpenFail" "true"
-    Option "BlankTime" "0"
-    Option "StandbyTime" "0"
-    Option "SuspendTime" "0"
-    Option "OffTime" "0"
-EndSection
 
-Section "InputClass"
-    Identifier "Arch Sunshine Input Bridge"
-    MatchProduct "Arch Sunshine Input Bridge"
-    Driver "libinput"
-EndSection
-
-Section "Device"
-    Identifier "ArchSunshineGPU"
-    Driver "modesetting"
-    Option "kmsdev" "${CARD_NODE}"
-    Option "AccelMethod" "glamor"
-    Option "PageFlip" "true"
-    Option "PrimaryGPU" "true"
-EndSection
-
-Section "Monitor"
-    Identifier "ArchSunshineMonitor"
-    HorizSync 5.0 - 1000.0
-    VertRefresh 5.0 - 200.0
-EndSection
-
-Section "Screen"
-    Identifier "ArchSunshineScreen"
-    Device "ArchSunshineGPU"
-    Monitor "ArchSunshineMonitor"
-    DefaultDepth 24
-    SubSection "Display"
-        Depth 24
-        Virtual ${WIDTH} ${HEIGHT}
-    EndSubSection
-EndSection
-EOF
-  else
-    cat > "${XORG_CONFIG}" <<EOF
-Section "ServerFlags"
-    Option "AutoAddDevices" "true"
-    Option "DontVTSwitch" "true"
-    Option "AllowMouseOpenFail" "true"
-EndSection
-
-Section "InputClass"
-    Identifier "Arch Sunshine Input Bridge"
-    MatchProduct "Arch Sunshine Input Bridge"
-    Driver "libinput"
-EndSection
-
-Section "Device"
-    Identifier "DummyDevice"
-    Driver "dummy"
-    VideoRam 512000
-EndSection
-
-Section "Monitor"
-    Identifier "DummyMonitor"
-    HorizSync 5.0 - 1000.0
-    VertRefresh 5.0 - 200.0
-    Modeline ${mode_line}
-EndSection
-
-Section "Screen"
-    Identifier "DummyScreen"
-    Device "DummyDevice"
-    Monitor "DummyMonitor"
-    DefaultDepth 24
-    SubSection "Display"
-        Depth 24
-        Modes "${mode_name}"
-        Virtual ${WIDTH} ${HEIGHT}
-    EndSubSection
-EndSection
-EOF
-  fi
-}
-
-configure_xrandr_monitor() {
-  local height_mm mode_args mode_line mode_name monitor_name output width_mm
-
-  mode_name="$(xrandr_mode_name)"
-  mode_line="$(cvt "${WIDTH}" "${HEIGHT}" "${REFRESH_RATE}" | awk '/Modeline/ {sub(/^Modeline /, ""); print}')"
-  if [ -z "${mode_line}" ]; then
-    mode_line="\"${mode_name}\" 173.00 ${WIDTH} $((WIDTH + 2048)) $((WIDTH + 2248)) $((WIDTH + 2576)) ${HEIGHT} $((HEIGHT + 3)) $((HEIGHT + 8)) $((HEIGHT + 38)) -hsync +vsync"
-  fi
-  mode_args="${mode_line#\"${mode_name}\" }"
-  width_mm=$((WIDTH * 254 / 960))
-  height_mm=$((HEIGHT * 254 / 960))
-  output=none
-
-  DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --fb "${WIDTH}x${HEIGHT}" \
-    >"${LOG_DIR}/xrandr.log" 2>&1 || true
-
-  if [ "${ACTIVE_DISPLAY_DRIVER}" = "modesetting" ]; then
-    DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --newmode "${mode_name}" ${mode_args} \
-      >>"${LOG_DIR}/xrandr.log" 2>&1 || true
-    DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --addmode "${OUTPUT_NAME}" "${mode_name}" \
-      >>"${LOG_DIR}/xrandr.log" 2>&1 || true
-    DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --output "${OUTPUT_NAME}" --mode "${mode_name}" --rate "${REFRESH_RATE}" --primary \
-      >>"${LOG_DIR}/xrandr.log" 2>&1 || true
-    output="${OUTPUT_NAME}"
-  elif [ "${ACTIVE_DISPLAY_DRIVER}" = "xwayland" ]; then
-    output="$(
-      DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --query 2>/dev/null \
-        | awk '/ connected/ { print $1; exit }'
-    )"
-    if [ -n "${output}" ]; then
-      DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --output "${output}" --mode "${WIDTH}x${HEIGHT}" --rate "${REFRESH_RATE}" --primary \
-        >>"${LOG_DIR}/xrandr.log" 2>&1 || true
-    else
-      output=none
-    fi
-  fi
-
-  monitor_name=ArchSunshine
-  if [ "${output}" != "none" ]; then
-    monitor_name="${output}"
-  fi
-
-  delete_xrandr_monitor ArchSunshine
-  if [ "${monitor_name}" != "ArchSunshine" ]; then
-    delete_xrandr_monitor "${monitor_name}"
-  fi
-  DISPLAY="${DISPLAY_NAME}" timeout 5s xrandr --setmonitor "${monitor_name}" "${WIDTH}/${width_mm}x${HEIGHT}/${height_mm}+0+0" "${output}" \
-    >>"${LOG_DIR}/xrandr.log" 2>&1 || true
-  apply_xrandr_dpi
-}
-
-launch_xorg_process() {
-  rm -f /tmp/.X"${DISPLAY_NUM}"-lock
-  rm -f /tmp/.X11-unix/X"${DISPLAY_NUM}"
-
-  Xorg "${DISPLAY_NAME}" \
-    -config "${XORG_CONFIG}" \
-    -noreset \
-    -ac \
-    -nolisten tcp \
-    -logfile "${LOG_DIR}/xorg.log" \
-    >"${LOG_DIR}/xorg.stdout.log" 2>&1 &
-  XORG_PID=$!
-
-  for _ in $(seq 1 100); do
-    if ! kill -0 "${XORG_PID}" 2>/dev/null; then
-      return 1
-    fi
-    if x_display_available; then
-      configure_xrandr_monitor
-      return 0
-    fi
-    sleep 0.1
-  done
-
-  return 1
-}
-
-launch_weston_process() {
-  rm -f "${RUNTIME_DIR}/${WAYLAND_SOCKET}" "${RUNTIME_DIR}/${WAYLAND_SOCKET}.lock"
-
-  run_desktop_base \
-    WLR_RENDER_DRM_DEVICE="${RENDER_NODE}" \
-    weston \
-      --backend=headless-backend.so \
-      --renderer=gl \
-      --width="${WIDTH}" \
-      --height="${HEIGHT}" \
-      --socket="${WAYLAND_SOCKET}" \
-      --idle-time=0 \
-    >"${LOG_DIR}/weston.log" 2>&1 &
-  WESTON_PID=$!
-
-  for _ in $(seq 1 100); do
-    if [ -S "${RUNTIME_DIR}/${WAYLAND_SOCKET}" ]; then
-      return 0
-    fi
-    if ! kill -0 "${WESTON_PID}" 2>/dev/null; then
-      return 1
-    fi
-    sleep 0.1
-  done
-
-  return 1
-}
-
-launch_xwayland_process() {
-  rm -f /tmp/.X"${DISPLAY_NUM}"-lock
-  rm -f /tmp/.X11-unix/X"${DISPLAY_NUM}"
-
-  run_desktop_base \
-    WAYLAND_DISPLAY="${WAYLAND_SOCKET}" \
-    Xwayland "${DISPLAY_NAME}" \
-      -geometry "${WIDTH}x${HEIGHT}" \
-      -fullscreen \
-      -ac \
-      -noreset \
-      -glamor es \
-      -verbose 2 \
-    >"${LOG_DIR}/xwayland.log" 2>&1 &
-  XWAYLAND_PID=$!
-
-  for _ in $(seq 1 100); do
-    if ! kill -0 "${XWAYLAND_PID}" 2>/dev/null; then
-      return 1
-    fi
-    if x_display_available; then
-      configure_xrandr_monitor
-      DISPLAY="${DISPLAY_NAME}" xset s off -dpms >/dev/null 2>&1 || true
-      return 0
-    fi
-    sleep 0.1
-  done
-
-  return 1
-}
-
-stop_xorg_process() {
-  if [ -n "${XORG_PID:-}" ]; then
-    terminate_pid_tree "${XORG_PID}"
-  fi
-  XORG_PID=""
-
-  rm -f /tmp/.X"${DISPLAY_NUM}"-lock
-  rm -f /tmp/.X11-unix/X"${DISPLAY_NUM}"
-}
-
-stop_xwayland_process() {
-  if [ -n "${XWAYLAND_PID:-}" ]; then
-    terminate_pid_tree "${XWAYLAND_PID}"
-  fi
-  XWAYLAND_PID=""
-  terminate_desktop_user_processes_named Xwayland
-
-  if [ -n "${WESTON_PID:-}" ]; then
-    terminate_pid_tree "${WESTON_PID}"
-  fi
-  WESTON_PID=""
-  terminate_desktop_user_processes_named weston
-  terminate_desktop_user_processes_named weston-keyboard
-  terminate_desktop_user_processes_named weston-desktop-
-
-  rm -f /tmp/.X"${DISPLAY_NUM}"-lock
-  rm -f /tmp/.X11-unix/X"${DISPLAY_NUM}"
-  rm -f "${RUNTIME_DIR}/${WAYLAND_SOCKET}" "${RUNTIME_DIR}/${WAYLAND_SOCKET}.lock"
-}
-
-launch_plasma_process() {
-  local fallback_started=0
-
-  run_as_desktop_user startplasma-x11 \
-    >"${LOG_DIR}/plasma.log" 2>&1 &
-  PLASMA_PID=$!
-
-  for _ in $(seq 1 600); do
-    if DISPLAY="${DISPLAY_NAME}" pgrep -u "${DESKTOP_UID}" -x plasmashell >/dev/null 2>&1; then
-      return 0
-    fi
-    if [ "${fallback_started}" -eq 0 ] \
-      && DISPLAY="${DISPLAY_NAME}" pgrep -u "${DESKTOP_UID}" -x kwin_x11 >/dev/null 2>&1; then
-      printf '%s\n' "plasmashell did not start automatically; starting fallback shell." \
-        >>"${LOG_DIR}/plasma.log"
-      run_as_desktop_user plasmashell --replace \
-        >>"${LOG_DIR}/plasma.log" 2>&1 &
-      fallback_started=1
-    fi
-    if ! kill -0 "${PLASMA_PID}" 2>/dev/null; then
-      [ "${fallback_started}" -eq 1 ] || return 1
-    fi
-    sleep 0.1
-  done
-
-  return 1
-}
-
-stop_display_processes() {
-  [ -n "${PLASMA_PID:-}" ] && terminate_pid "${PLASMA_PID}"
-  pkill -TERM -u "${DESKTOP_UID}" -x plasmashell 2>/dev/null || true
-  pkill -TERM -u "${DESKTOP_UID}" -x kwin_x11 2>/dev/null || true
-  pkill -TERM -u "${DESKTOP_UID}" -x kded6 2>/dev/null || true
-  PLASMA_PID=""
-
-  stop_xorg_process
-  stop_xwayland_process
-  sleep 0.3
-  pkill -KILL -u "${DESKTOP_UID}" -x plasmashell 2>/dev/null || true
-  pkill -KILL -u "${DESKTOP_UID}" -x kwin_x11 2>/dev/null || true
-
-  rm -f /tmp/.X"${DISPLAY_NUM}"-lock
-  rm -f /tmp/.X11-unix/X"${DISPLAY_NUM}"
-}
-
-start_system_bus() {
-  mkdir -p /run/dbus
-  if system_bus_ready; then
+def command_client_stop(_args):
+    try:
+        send_control_message({"command": "client-stop"})
+    except StreamError as exc:
+        eprint(f"arch-sunshine: {exc}")
     return 0
-  fi
 
-  rm -f /run/dbus/system_bus_socket /run/dbus/pid
 
-  dbus-daemon --system --nofork --nopidfile \
-    >"${LOG_DIR}/dbus-system.log" 2>&1 &
-  SYSTEM_DBUS_PID=$!
+def command_disconnect(args):
+    urls = (
+        "https://127.0.0.1:47984/api/apps/close",
+        "https://127.0.0.1:47990/api/apps/close",
+        "http://127.0.0.1:47989/api/apps/close",
+    )
+    response_log = []
+    for url in urls:
+        result = run_checked(
+            [
+                "curl",
+                "-k",
+                "-sS",
+                "--connect-timeout",
+                "1",
+                "--max-time",
+                "3",
+                "-u",
+                f"{args.user}:{args.password}",
+                "-H",
+                "Content-Type: application/json",
+                "-X",
+                "POST",
+                url,
+                "--data",
+                "{}",
+                "-w",
+                "\n%{http_code}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        response = (result.stdout or "") + (result.stderr or "")
+        response_log.append(f"{url} rc={result.returncode} response={response.strip()}")
+        if result.returncode == 0:
+            http_code = response.strip().splitlines()[-1] if response.strip() else ""
+            if http_code == "200":
+                break
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with (LOG_DIR / "disconnect.log").open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(response_log) + "\n")
+    except OSError:
+        pass
+    return command_client_stop(args)
 
-  for _ in $(seq 1 50); do
-    if [ -S /run/dbus/system_bus_socket ]; then
-      return 0
-    fi
-    if ! kill -0 "${SYSTEM_DBUS_PID}" 2>/dev/null; then
-      return 1
-    fi
-    sleep 0.1
-  done
 
-  return 1
-}
+def command_session_actions(args):
+    try:
+        import dbus
+        import dbus.service
+        from dbus.mainloop.glib import DBusGMainLoop
+        from gi.repository import GLib
+    except ImportError as exc:
+        raise StreamError(f"session action service dependencies are missing: {exc}") from exc
 
-system_bus_ready() {
-  [ -S /run/dbus/system_bus_socket ] || return 1
-  dbus-send --system --print-reply \
-    --dest=org.freedesktop.DBus \
-    /org/freedesktop/DBus \
-    org.freedesktop.DBus.ListNames >/dev/null 2>&1
-}
+    DBusGMainLoop(set_as_default=True)
+    bus = dbus.SessionBus()
+    shutdown_name = dbus.service.BusName("org.kde.Shutdown", bus=bus, do_not_queue=True)
+    logout_prompt_name = dbus.service.BusName("org.kde.LogoutPrompt", bus=bus, do_not_queue=True)
 
-network_status_service_ready() {
-  dbus-send --system --print-reply \
-    --dest=org.freedesktop.DBus \
-    /org/freedesktop/DBus \
-    org.freedesktop.DBus.GetNameOwner \
-    string:org.freedesktop.NetworkManager >/dev/null 2>&1
-}
+    def disconnect_async():
+        def run():
+            service_args = argparse.Namespace(user=args.user, password=args.password)
+            try:
+                command_disconnect(service_args)
+            except Exception as exc:  # noqa: BLE001 - keep the D-Bus service alive.
+                try:
+                    LOG_DIR.mkdir(parents=True, exist_ok=True)
+                    with (LOG_DIR / "session-actions.log").open("a", encoding="utf-8") as handle:
+                        handle.write(f"disconnect failed: {exc}\n")
+                except OSError:
+                    pass
 
-start_network_status() {
-  if network_status_service_ready; then
+        threading.Thread(target=run, daemon=True).start()
+
+    class ShutdownObject(dbus.service.Object):
+        @dbus.service.method("org.kde.Shutdown")
+        def logout(self):
+            disconnect_async()
+
+        @dbus.service.method("org.kde.Shutdown")
+        def logoutAndShutdown(self):
+            disconnect_async()
+
+        @dbus.service.method("org.kde.Shutdown")
+        def logoutAndReboot(self):
+            disconnect_async()
+
+        @dbus.service.method("org.kde.Shutdown")
+        def saveSession(self):
+            return
+
+    class LogoutPromptObject(dbus.service.Object):
+        @dbus.service.method("org.kde.LogoutPrompt")
+        def promptLogout(self):
+            disconnect_async()
+
+        @dbus.service.method("org.kde.LogoutPrompt")
+        def promptShutDown(self):
+            disconnect_async()
+
+        @dbus.service.method("org.kde.LogoutPrompt")
+        def promptReboot(self):
+            disconnect_async()
+
+        @dbus.service.method("org.kde.LogoutPrompt")
+        def promptAll(self):
+            disconnect_async()
+
+    ShutdownObject(shutdown_name, "/Shutdown")
+    LogoutPromptObject(logout_prompt_name, "/LogoutPrompt")
+
+    loop = GLib.MainLoop()
+
+    def stop(_signum=None, _frame=None):
+        loop.quit()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    loop.run()
     return 0
-  fi
 
-  arch-sunshine-network-status >"${LOG_DIR}/network-status.log" 2>&1 &
-  NETWORK_STATUS_PID=$!
 
-  for _ in $(seq 1 50); do
-    if network_status_service_ready; then
-      return 0
-    fi
-    if ! kill -0 "${NETWORK_STATUS_PID}" 2>/dev/null; then
-      return 1
-    fi
-    sleep 0.1
-  done
-
-  return 1
-}
-
-start_session_bus() {
-  local output
-
-  rm -f "${RUNTIME_DIR}/bus"
-  output="$(
-    run_desktop_base dbus-daemon \
-      --session \
-      --fork \
-      --address="unix:path=${RUNTIME_DIR}/bus" \
-      --print-address \
-      --print-pid
-  )"
-  DBUS_SESSION_BUS_ADDRESS="$(printf '%s\n' "${output}" | sed -n '1p')"
-  SESSION_DBUS_PID="$(printf '%s\n' "${output}" | sed -n '2p')"
-  export DBUS_SESSION_BUS_ADDRESS
-
-  for _ in $(seq 1 50); do
-    if [ -S "${RUNTIME_DIR}/bus" ]; then
-      return 0
-    fi
-    if [ -n "${SESSION_DBUS_PID:-}" ] && ! kill -0 "${SESSION_DBUS_PID}" 2>/dev/null; then
-      return 1
-    fi
-    sleep 0.1
-  done
-
-  return 1
-}
-
-start_pipewire() {
-  run_as_desktop_user pipewire >"${LOG_DIR}/pipewire.log" 2>&1 &
-  PIPEWIRE_PID=$!
-
-  for _ in $(seq 1 50); do
-    if [ -S "${RUNTIME_DIR}/pipewire-0" ]; then
-      break
-    fi
-    if ! kill -0 "${PIPEWIRE_PID}" 2>/dev/null; then
-      return 1
-    fi
-    sleep 0.1
-  done
-
-  if [ ! -S "${RUNTIME_DIR}/pipewire-0" ]; then
-    return 1
-  fi
-
-  run_as_desktop_user wireplumber >"${LOG_DIR}/wireplumber.log" 2>&1 &
-  WIREPLUMBER_PID=$!
-
-  run_as_desktop_user pipewire-pulse >"${LOG_DIR}/pipewire-pulse.log" 2>&1 &
-  PIPEWIRE_PULSE_PID=$!
-
-  for _ in $(seq 1 50); do
-    if [ -S "${RUNTIME_DIR}/pulse/native" ]; then
-      break
-    fi
-    if ! kill -0 "${PIPEWIRE_PID}" 2>/dev/null || ! kill -0 "${PIPEWIRE_PULSE_PID}" 2>/dev/null; then
-      return 1
-    fi
-    sleep 0.1
-  done
-
-  if [ ! -S "${RUNTIME_DIR}/pulse/native" ]; then
-    return 1
-  fi
-
-  ensure_audio_sink
-}
-
-ensure_audio_sink() {
-  local pactl_env=(
-    "XDG_RUNTIME_DIR=${RUNTIME_DIR}"
-    "PULSE_SERVER=unix:${RUNTIME_DIR}/pulse/native"
-  )
-
-  if ! runuser -u "${DESKTOP_USER}" -- env "${pactl_env[@]}" pactl list short sinks \
-    | awk '{print $2}' | grep -qx arch_sunshine_audio; then
-    runuser -u "${DESKTOP_USER}" -- env "${pactl_env[@]}" pactl load-module module-null-sink \
-      sink_name=arch_sunshine_audio \
-      sink_properties=device.description=Arch_Sunshine_Audio \
-      >"${LOG_DIR}/audio-sink.log" 2>&1 || return 1
-  fi
-
-  runuser -u "${DESKTOP_USER}" -- env "${pactl_env[@]}" pactl list short sinks \
-    >"${LOG_DIR}/audio-sinks.log" 2>&1 || true
-  runuser -u "${DESKTOP_USER}" -- env "${pactl_env[@]}" pactl list short sources \
-    >"${LOG_DIR}/audio-sources.log" 2>&1 || true
-
-  return 0
-}
-
-start_input_bridge() {
-  local mode=evdev
-
-  if [ -n "${INPUT_BRIDGE_PID:-}" ] && kill -0 "${INPUT_BRIDGE_PID}" 2>/dev/null; then
-    return 0
-  fi
-
-  if [ "${ACTIVE_DISPLAY_DRIVER}" = "xwayland" ]; then
-    mode=xtest
-    DISPLAY="${DISPLAY_NAME}" \
-      XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
-      ARCH_SUNSHINE_INPUT_MODE=xtest \
-      arch-sunshine-input-bridge >"${LOG_DIR}/input-bridge.log" 2>&1 &
-  else
-    arch-sunshine-input-bridge >"${LOG_DIR}/input-bridge.log" 2>&1 &
-  fi
-  INPUT_BRIDGE_PID=$!
-
-  for _ in $(seq 1 50); do
-    seed_input_devices
-    if [ "${mode}" = "xtest" ] && kill -0 "${INPUT_BRIDGE_PID}" 2>/dev/null; then
-      return 0
-    fi
-    if grep -q 'Arch Sunshine Input Bridge' /proc/bus/input/devices 2>/dev/null; then
-      return 0
-    fi
-    if ! kill -0 "${INPUT_BRIDGE_PID}" 2>/dev/null; then
-      return 1
-    fi
-    sleep 0.1
-  done
-
-  return 1
-}
-
-start_capture_display() {
-  seed_input_devices
-  resolve_display_driver
-
-  if [ "${ACTIVE_DISPLAY_DRIVER}" = "xwayland" ]; then
-    write_desktop_env
-    if ! launch_weston_process || ! launch_xwayland_process; then
-      stop_xwayland_process
-      log "GPU Xwayland display failed; falling back to dummy Xorg."
-      write_xorg_config dummy
-      launch_xorg_process || return 1
-    fi
-  elif [ "${ACTIVE_DISPLAY_DRIVER}" = "modesetting" ] && [ -e "${CARD_NODE}" ]; then
-    write_xorg_config "${ACTIVE_DISPLAY_DRIVER}"
-    if ! launch_xorg_process; then
-      stop_xorg_process
-      log "GPU modesetting display failed; falling back to dummy Xorg."
-      write_xorg_config dummy
-      launch_xorg_process || return 1
-    fi
-  else
-    if [ "${DISPLAY_DRIVER}" != "dummy" ]; then
-      log "No connected DRM output found; using dummy Xorg for Plasma."
-    fi
-    write_xorg_config dummy
-    launch_xorg_process || return 1
-  fi
-}
-
-start_desktop_services() {
-  if [ "${ACTIVE_DISPLAY_DRIVER}" != "xwayland" ]; then
-    start_input_bridge || return 1
-  fi
-  start_session_bus || return 1
-  start_pipewire || return 1
-
-  if [ "${ACTIVE_DISPLAY_DRIVER}" = "xwayland" ]; then
-    start_input_bridge || return 1
-  fi
-
-  write_kde_session_config
-  launch_plasma_process || return 1
-  apply_desktop_scale_runtime
-  ensure_panel_task_launchers
-  ensure_disconnect_panel_button
-}
-
-start_display() {
-  start_capture_display || return 1
-  start_desktop_services
-}
-
-start_sunshine() {
-  if [ -n "${SUNSHINE_VAAPI_DRIVER:-}" ]; then
-    export LIBVA_DRIVER_NAME="${SUNSHINE_VAAPI_DRIVER}"
-  fi
-
-  run_as_desktop_user sunshine "${CONFIG_DIR}/sunshine.conf" >"${LOG_DIR}/sunshine.stdout.log" 2>&1 &
-  SUNSHINE_PID=$!
-}
-
-prepare_session_runtime() {
-  mkdir -p "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}" "${PERSISTENT_HOME_DIR}" "${RUNTIME_DIR}" "${SESSION_RUNTIME_DIR}"
-  bind_home_dir
-  chown -R "${DESKTOP_UID}:${DESKTOP_GID}" "${CONFIG_DIR}" "${STATE_DIR}" "${LOG_DIR}"
-  chown "${DESKTOP_UID}:${DESKTOP_GID}" "${HOME_DIR}" 2>/dev/null || true
-  chown "${DESKTOP_UID}:${DESKTOP_GID}" "${RUNTIME_DIR}"
-  chmod 700 "${RUNTIME_DIR}"
-  chmod 1777 /var/lib/xkb /tmp
-  chmod 666 /dev/uinput /dev/uhid 2>/dev/null || true
-  chmod 666 /dev/dri/card* /dev/dri/renderD* 2>/dev/null || true
-}
-
-session_has_live_process() {
-  local pid
-
-  for pid in \
-    "${XORG_PID:-}" \
-    "${XWAYLAND_PID:-}" \
-    "${WESTON_PID:-}" \
-    "${PLASMA_PID:-}" \
-    "${INPUT_BRIDGE_PID:-}" \
-    "${PIPEWIRE_PID:-}" \
-    "${PIPEWIRE_PULSE_PID:-}" \
-    "${WIREPLUMBER_PID:-}" \
-    "${SESSION_DBUS_PID:-}"; do
-    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-capture_display_live() {
-  local pid
-
-  for pid in "${XORG_PID:-}" "${XWAYLAND_PID:-}" "${WESTON_PID:-}"; do
-    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
-      x_display_available && return 0
-    fi
-  done
-
-  return 1
-}
-
-desktop_session_live() {
-  local pid
-
-  for pid in \
-    "${PLASMA_PID:-}" \
-    "${INPUT_BRIDGE_PID:-}" \
-    "${PIPEWIRE_PID:-}" \
-    "${PIPEWIRE_PULSE_PID:-}" \
-    "${WIREPLUMBER_PID:-}" \
-    "${SESSION_DBUS_PID:-}"; do
-    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-x_display_size_matches() {
-  local actual
-
-  actual="$(current_x_display_size)"
-  [ "${actual}" = "${WIDTH}x${HEIGHT}" ]
-}
-
-current_x_display_size() {
-  local output
-
-  output="$(DISPLAY="${DISPLAY_NAME}" timeout 3s xdpyinfo 2>/dev/null || true)"
-  printf '%s\n' "${output}" | awk '/dimensions:/ { print $2; exit }'
-}
-
-stop_desktop_user_processes() {
-  local comm pid
-
-  for pid in $(pgrep -u "${DESKTOP_UID}" 2>/dev/null || true); do
-    case "${pid}" in
-      "${XWAYLAND_PID:-}"|"${WESTON_PID:-}"|"${XORG_PID:-}") continue ;;
-    esac
-    comm="$(cat "/proc/${pid}/comm" 2>/dev/null || true)"
-    case "${comm}" in
-      sunshine|Xwayland|weston|Xorg) continue ;;
-    esac
-    kill -TERM "${pid}" 2>/dev/null || true
-  done
-
-  sleep 0.5
-
-  for pid in $(pgrep -u "${DESKTOP_UID}" 2>/dev/null || true); do
-    case "${pid}" in
-      "${XWAYLAND_PID:-}"|"${WESTON_PID:-}"|"${XORG_PID:-}") continue ;;
-    esac
-    comm="$(cat "/proc/${pid}/comm" 2>/dev/null || true)"
-    case "${comm}" in
-      sunshine|Xwayland|weston|Xorg) continue ;;
-    esac
-    kill -KILL "${pid}" 2>/dev/null || true
-  done
-}
-
-stop_desktop_services() {
-  [ -n "${PLASMA_PID:-}" ] && terminate_pid "${PLASMA_PID}"
-  pkill -TERM -u "${DESKTOP_UID}" -x plasmashell 2>/dev/null || true
-  pkill -TERM -u "${DESKTOP_UID}" -x kwin_x11 2>/dev/null || true
-  pkill -TERM -u "${DESKTOP_UID}" -x kded6 2>/dev/null || true
-  PLASMA_PID=""
-
-  [ -n "${INPUT_BRIDGE_PID:-}" ] && terminate_pid "${INPUT_BRIDGE_PID}"
-  INPUT_BRIDGE_PID=""
-
-  stop_desktop_user_processes
-
-  [ -n "${WIREPLUMBER_PID:-}" ] && terminate_pid "${WIREPLUMBER_PID}"
-  [ -n "${PIPEWIRE_PULSE_PID:-}" ] && terminate_pid "${PIPEWIRE_PULSE_PID}"
-  [ -n "${PIPEWIRE_PID:-}" ] && terminate_pid "${PIPEWIRE_PID}"
-  [ -n "${SESSION_DBUS_PID:-}" ] && terminate_pid "${SESSION_DBUS_PID}"
-
-  WIREPLUMBER_PID=""
-  PIPEWIRE_PULSE_PID=""
-  PIPEWIRE_PID=""
-  SESSION_DBUS_PID=""
-  DESKTOP_ACTIVE=0
-
-  rm -f "${RUNTIME_DIR}/pipewire-0" "${RUNTIME_DIR}/pulse/native" "${RUNTIME_DIR}/bus"
-}
-
-stop_base_services() {
-  [ -n "${NETWORK_STATUS_PID:-}" ] && terminate_pid "${NETWORK_STATUS_PID}"
-  [ -n "${SYSTEM_DBUS_PID:-}" ] && terminate_pid "${SYSTEM_DBUS_PID}"
-  NETWORK_STATUS_PID=""
-  SYSTEM_DBUS_PID=""
-}
-
-stop_desktop_runtime() {
-  stop_desktop_services
-  stop_display_processes
-  rm -f "${RUNTIME_DIR}/${WAYLAND_SOCKET}" "${RUNTIME_DIR}/${WAYLAND_SOCKET}.lock"
-  rm -f "${SESSION_STATE_FILE}"
-}
-
-session_start_locked() {
-  local requested_height requested_refresh requested_scale requested_width
-
-  requested_width="$(sanitize_positive_int "${1:-${DEFAULT_WIDTH}}" "${DEFAULT_WIDTH}" 8192)"
-  requested_height="$(sanitize_positive_int "${2:-${DEFAULT_HEIGHT}}" "${DEFAULT_HEIGHT}" 8192)"
-  requested_refresh="$(sanitize_refresh_rate "${3:-${DEFAULT_REFRESH_RATE}}" "${DEFAULT_REFRESH_RATE}")"
-  requested_scale="$(sanitize_scale_request "${4:-${DEFAULT_SCALE}}" "${DEFAULT_SCALE}")"
-
-  load_session_state >/dev/null 2>&1 || reset_session_vars
-
-  if [ "${DESKTOP_ACTIVE:-0}" = "1" ] && desktop_session_live; then
-    log "Desktop session already running at ${WIDTH}x${HEIGHT}@${REFRESH_RATE}."
-    return 0
-  fi
-
-  set_session_geometry "${requested_width}" "${requested_height}" "${requested_refresh}" "${requested_scale}"
-  prepare_session_runtime
-  start_system_bus || return 1
-  start_network_status || log "Network status service failed; Plasma may show disconnected."
-
-  if capture_display_live; then
-    configure_xrandr_monitor
-    write_kde_session_config
-  fi
-
-  if ! capture_display_live || ! x_display_size_matches; then
-    log "Restarting capture display for ${WIDTH}x${HEIGHT}@${REFRESH_RATE}."
-    stop_display_processes
-    if ! start_capture_display; then
-      log "Capture display failed to start at ${WIDTH}x${HEIGHT}@${REFRESH_RATE}."
-      stop_desktop_runtime
-      return 1
-    fi
-  fi
-
-  if ! x_display_size_matches; then
-    log "Capture display is $(current_x_display_size || printf unknown), not requested ${WIDTH}x${HEIGHT}; refusing to start a mismatched stream."
-    stop_desktop_runtime
-    return 1
-  fi
-
-  if ! start_desktop_services; then
-    log "Desktop session failed to start at ${WIDTH}x${HEIGHT}@${REFRESH_RATE}."
-    stop_desktop_services
-    write_session_state
-    return 1
-  fi
-
-  DESKTOP_ACTIVE=1
-  write_session_state
-  log "Desktop session started at ${WIDTH}x${HEIGHT}@${REFRESH_RATE} scale ${SCALE} using ${ACTIVE_DISPLAY_DRIVER}."
-}
-
-session_start() {
-  local status
-
-  acquire_session_lock
-  trap release_session_lock EXIT INT TERM
-
-  if session_start_locked "$@"; then
-    status=0
-  else
-    status=$?
-  fi
-
-  release_session_lock
-  trap - EXIT INT TERM
-  return "${status}"
-}
-
-session_stop_locked() {
-  if load_session_state; then
-    log "Stopping desktop session."
-    stop_desktop_services
-    write_session_state
-  else
-    reset_session_vars
-    rm -f "${SESSION_STATE_FILE}"
-    log "Desktop session is already stopped."
-  fi
-}
-
-session_stop() {
-  local status
-
-  acquire_session_lock
-  trap release_session_lock EXIT INT TERM
-
-  if session_stop_locked; then
-    status=0
-  else
-    status=$?
-  fi
-
-  release_session_lock
-  trap - EXIT INT TERM
-  return "${status}"
-}
-
-client_session_start() {
-  local requested_height requested_refresh requested_scale requested_width
-
-  requested_width="${SUNSHINE_CLIENT_WIDTH:-${DEFAULT_WIDTH}}"
-  requested_height="${SUNSHINE_CLIENT_HEIGHT:-${DEFAULT_HEIGHT}}"
-  requested_refresh="${SUNSHINE_CLIENT_FPS:-${DEFAULT_REFRESH_RATE}}"
-  requested_scale="${SUNSHINE_CLIENT_SCALE:-${SUNSHINE_SCALE:-${DEFAULT_SCALE}}}"
-
-  if [ "$(id -u)" -eq 0 ]; then
-    exec /usr/local/bin/arch-sunshine session-start "${requested_width}" "${requested_height}" "${requested_refresh}" "${requested_scale}"
-  fi
-
-  exec /usr/bin/sudo -n /usr/local/bin/arch-sunshine session-start "${requested_width}" "${requested_height}" "${requested_refresh}" "${requested_scale}"
-}
-
-client_session_stop() {
-  mkdir -p "${LOG_DIR}" 2>/dev/null || true
-
-  if [ "$(id -u)" -eq 0 ]; then
-    setsid -f /usr/local/bin/arch-sunshine session-stop \
-      >>"${LOG_DIR}/client-stop.log" 2>&1 </dev/null
-    return 0
-  fi
-
-  setsid -f /usr/bin/sudo -n /usr/local/bin/arch-sunshine session-stop \
-    >>"${LOG_DIR}/client-stop.log" 2>&1 </dev/null
-}
-
-disconnect_session() {
-  local http_code response response_body
-
-  mkdir -p "${LOG_DIR}" 2>/dev/null || true
-
-  response="$(
-    curl -k -sS --connect-timeout 1 --max-time 3 \
-      -u "${WEB_UI_USER}:${WEB_UI_PASS}" \
-      -H 'Content-Type: application/json' \
-      -X POST https://127.0.0.1:47990/api/apps/close \
-      --data '{}' \
-      -w '\n%{http_code}' 2>&1
-  )" || true
-
-  http_code="${response##*$'\n'}"
-  response_body="${response%$'\n'*}"
-  printf '%s http=%s response=%s\n' "$(date -Is)" "${http_code}" "${response_body}" \
-    >>"${LOG_DIR}/disconnect.log" 2>/dev/null || true
-
-  if [ "${http_code}" = "200" ] && printf '%s' "${response_body}" | grep -q '"status"[[:space:]]*:[[:space:]]*true'; then
-    return 0
-  fi
-
-  client_session_stop
-}
-
-shutdown() {
-  [ -n "${SUNSHINE_PID:-}" ] && terminate_pid "${SUNSHINE_PID}"
-  load_session_state >/dev/null 2>&1 || reset_session_vars
-  stop_desktop_runtime
-  stop_base_services
-  if mountpoint -q "${HOME_DIR}"; then
-    umount "${HOME_DIR}" 2>/dev/null || true
-  fi
-}
-
-process_status() {
-  local pid="${1:-}"
-
-  if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
-    printf 'running'
-  else
-    printf 'stopped'
-  fi
-}
-
-last_matching_line() {
-  local pattern="$1"
-  local file="$2"
-
-  if [ -f "${file}" ]; then
-    grep -E "${pattern}" "${file}" | tail -n 1 || true
-  fi
-}
-
-encoder_summary() {
-  local file="${LOG_DIR}/sunshine.stdout.log"
-  local h264 hevc vendor
-
-  h264="$(last_matching_line 'Found H\.264 encoder' "${file}")"
-  hevc="$(last_matching_line 'Found HEVC encoder' "${file}")"
-  vendor="$(last_matching_line 'vaapi vendor' "${file}")"
-
-  if [ -n "${h264}" ] || [ -n "${hevc}" ]; then
-    printf '%s\n' "${h264##*Info: }"
-    printf '%s\n' "${hevc##*Info: }"
-  else
-    printf 'probing\n'
-  fi
-
-  if [ -n "${vendor}" ]; then
-    printf '%s\n' "${vendor##*Info: }"
-  fi
-}
-
-display_log_file() {
-  case "${ACTIVE_DISPLAY_DRIVER}" in
-    xwayland) printf '%s\n' "${LOG_DIR}/xwayland.log" ;;
-    *) printf '%s\n' "${LOG_DIR}/xorg.log" ;;
-  esac
-}
-
-session_display_status() {
-  if load_session_state; then
-    if [ "${DESKTOP_ACTIVE:-0}" = "1" ] && desktop_session_live; then
-      printf 'running'
-      return
-    fi
-    if capture_display_live; then
-      printf 'sleeping'
-      return
-    fi
-  fi
-
-  reset_session_vars
-  set_session_geometry "${DEFAULT_WIDTH}" "${DEFAULT_HEIGHT}" "${DEFAULT_REFRESH_RATE}"
-  ACTIVE_DISPLAY_DRIVER="${DISPLAY_DRIVER}"
-  printf 'stopped'
-}
-
-wait_for_key() {
-  printf '\nPress any key to return.'
-  IFS= read -rsn1 _ || true
-}
-
-draw_ui() {
-  local display_state
-
-  display_state="$(session_display_status)"
-
-  printf '\033[2J\033[H'
-  printf 'Arch Sunshine\n'
-  printf '==============\n\n'
-  printf 'Status\n'
-  printf '  Desktop   %s  KDE Plasma X11 %s on %s %sx%s@%s scale %s\n' "${display_state}" "${ACTIVE_DISPLAY_DRIVER}" "${DISPLAY_NAME}" "${WIDTH}" "${HEIGHT}" "${REFRESH_RATE}" "${SCALE}"
-  printf '  Sunshine  %s  https://<host-ip>:47990\n' "$(process_status "${SUNSHINE_PID:-}")"
-  printf '  Capture   x11 on %s\n' "${DISPLAY_NAME}"
-  printf '  User      %s / %s\n' "${DESKTOP_USER}" "${DESKTOP_USER}"
-  printf '  Data      %s\n\n' "${USER_DATA}"
-  printf 'Encoder\n'
-  encoder_summary | sed 's/^/  /'
-  printf '\nLogs\n'
-  printf '  Sunshine  %s\n' "${LOG_DIR}/sunshine.log"
-  printf '  Xorg      %s\n' "${LOG_DIR}/xorg.log"
-  printf '  Weston    %s\n' "${LOG_DIR}/weston.log"
-  printf '  Xwayland  %s\n' "${LOG_DIR}/xwayland.log"
-  printf '  Plasma    %s\n\n' "${LOG_DIR}/plasma.log"
-  printf 'Commands\n'
-  printf '  p  pair PIN from Moonlight\n'
-  printf '  l  show Sunshine log tail\n'
-  printf '  d  show display log tail\n'
-  printf '  t  show Steam launch log tail\n'
-  printf '  s  open shell as %s\n' "${DESKTOP_USER}"
-  printf '  q  quit\n\n'
-  printf 'Waiting for command... '
-}
-
-show_log_tail() {
-  local title="$1"
-  local file="$2"
-
-  printf '\033[2J\033[H'
-  printf '%s\n' "${title}"
-  printf '%s\n\n' "${file}"
-  if [ -f "${file}" ]; then
-    tail -n 40 "${file}"
-  else
-    printf 'Log file does not exist yet.\n'
-  fi
-  wait_for_key
-}
-
-pair_device() {
-  local body device http_code name pin response response_body
-
-  printf '\033[2J\033[H'
-  printf 'Pair Moonlight Device\n'
-  printf '=====================\n\n'
-  printf 'In Moonlight, choose Arch Sunshine and start pairing first.\n'
-  printf 'Then enter the PIN Moonlight shows here.\n\n'
-  printf 'Client name (Enter for Moonlight): '
-  IFS= read -r device || true
-  printf 'PIN (4 digits): '
-  IFS= read -r pin || true
-
-  if [[ ! "${pin}" =~ ^[0-9]{4}$ ]]; then
-    printf '\nPIN was not submitted: expected exactly 4 digits.\n'
-    wait_for_key
-    return
-  fi
-
-  name="$(printf '%s' "${device:-Moonlight}" | tr -cd '[:alnum:] ._-')"
-  if [ -z "${name}" ]; then
-    name=Moonlight
-  fi
-  body="$(printf '{"pin":"%s","name":"%s"}' "${pin}" "${name}")"
-
-  response="$(
-    curl -k -sS --connect-timeout 2 --max-time 8 \
-      -u "${WEB_UI_USER}:${WEB_UI_PASS}" \
-      -H 'Content-Type: application/json' \
-      -X POST https://127.0.0.1:47990/api/pin \
-      --data "${body}" \
-      -w '\n%{http_code}' 2>&1
-  )" || true
-
-  http_code="${response##*$'\n'}"
-  response_body="${response%$'\n'*}"
-  printf '%s device=%s pin-submitted http=%s response=%s\n' \
-    "$(date -Is)" "${name}" "${http_code}" "${response_body}" >> "${LOG_DIR}/pair.log"
-
-  if [ "${http_code}" = "200" ] && printf '%s' "${response_body}" | grep -q '"status"[[:space:]]*:[[:space:]]*true'; then
-    printf '\nPairing accepted by Sunshine.\n'
-  else
-    printf '\nPairing was not accepted by Sunshine.\n\n'
-    printf '%s\n' "${response_body}"
-    printf '\nMake sure Moonlight is actively showing the PIN for Arch Sunshine, not Wolf.\n'
-  fi
-  wait_for_key
-}
-
-open_shell() {
-  printf '\033[2J\033[H'
-  printf 'Container shell as %s. Root sudo is limited to session controls. Type exit to return.\n\n' "${DESKTOP_USER}"
-  run_as_desktop_user /bin/bash || true
-}
-
-run_ui_loop() {
-  local key
-
-  while true; do
-    if ! kill -0 "${SUNSHINE_PID}" 2>/dev/null; then
-      printf '\nSunshine process exited.\n'
-      return
-    fi
-
-    draw_ui
-    IFS= read -rsn1 -t 1 key || key=""
-    case "${key}" in
-      p|P) pair_device ;;
-      l|L) show_log_tail "Sunshine Log" "${LOG_DIR}/sunshine.log" ;;
-      d|D) show_log_tail "Display Log" "$(display_log_file)" ;;
-      t|T) show_log_tail "Steam Launch Log" "${HOME_DIR}/.local/share/Steam/logs/arch-sunshine-launch.log" ;;
-      s|S) open_shell ;;
-      q|Q) printf '\nStopping Arch Sunshine.\n'; return ;;
-      *) ;;
-    esac
-  done
-}
-
-run_daemon_loop() {
-  while true; do
-    if ! kill -0 "${SUNSHINE_PID}" 2>/dev/null; then
-      log "Sunshine process exited"
-      break
-    fi
-    sleep 1
-  done
-}
-
-main() {
-  reset_session_vars
-  trap shutdown INT TERM EXIT
-  setup_runtime_writable_mounts || {
-    log "Runtime writable mount setup failed; immutable mode requires a privileged container."
-    exit 1
-  }
-  ensure_machine_id
-  configure_network_resolution
-  lock_root_filesystem || {
-    log "Failed to remount the container root filesystem read-only."
-    exit 1
-  }
-  mount_runtime_resolv_conf || log "Failed to mount runtime /etc/resolv.conf; DNS may not work."
-  setup_user_data
-  seed_web_credentials
-  set_session_geometry "${DEFAULT_WIDTH}" "${DEFAULT_HEIGHT}" "${DEFAULT_REFRESH_RATE}"
-  prepare_session_runtime
-  start_system_bus || {
-    log "System D-Bus failed to start"
-    exit 1
-  }
-  start_network_status || log "Network status service failed; Plasma may show disconnected."
-  start_capture_display || {
-    log "X11 capture display failed to start"
-    log "Xorg logs: ${LOG_DIR}/xorg.log"
-    log "Weston logs: ${LOG_DIR}/weston.log"
-    log "Xwayland logs: ${LOG_DIR}/xwayland.log"
-    exit 1
-  }
-  DESKTOP_ACTIVE=0
-  write_session_state
-  start_sunshine
-
-  log "Arch Sunshine"
-  log "Desktop: sleeping until Moonlight starts an app"
-  log "Display: X11 capture display ${ACTIVE_DISPLAY_DRIVER} on ${DISPLAY_NAME} (${WIDTH}x${HEIGHT}@${REFRESH_RATE})"
-  log "Encoder: Sunshine auto-select"
-  log "Sunshine web UI: https://<host-ip>:47990"
-  log "Sunshine logs: ${LOG_DIR}/sunshine.log"
-  log "Xorg logs: ${LOG_DIR}/xorg.log"
-  log "Weston logs: ${LOG_DIR}/weston.log"
-  log "Xwayland logs: ${LOG_DIR}/xwayland.log"
-  log "Plasma logs: ${LOG_DIR}/plasma.log"
-
-  if [ -t 0 ]; then
-    sleep 1
-    run_ui_loop
-  else
-    run_daemon_loop
-  fi
-
-  shutdown
-  [ -n "${SUNSHINE_PID:-}" ] && wait "${SUNSHINE_PID}" 2>/dev/null || true
-  [ -n "${PLASMA_PID:-}" ] && wait "${PLASMA_PID}" 2>/dev/null || true
-  [ -n "${XORG_PID:-}" ] && wait "${XORG_PID}" 2>/dev/null || true
-  [ -n "${XWAYLAND_PID:-}" ] && wait "${XWAYLAND_PID}" 2>/dev/null || true
-  [ -n "${WESTON_PID:-}" ] && wait "${WESTON_PID}" 2>/dev/null || true
-}
-
-case "${1:-}" in
-  client-start)
-    client_session_start
-    ;;
-  client-stop)
-    client_session_stop
-    ;;
-  disconnect)
-    disconnect_session
-    ;;
-  session-start)
-    shift
-    session_start "$@"
-    ;;
-  session-stop)
-    session_stop
-    ;;
-  *)
-    main "$@"
-    ;;
-esac
+def add_pipeline_args(parser):
+    parser.add_argument("--config", default=os.environ.get("SUNSHINE_CONFIG", str(DEFAULT_CONFIG)))
+    parser.add_argument("--codec", choices=("h264", "hevc", "av1"), default="h264")
+    parser.add_argument("--encoder", default="")
+    parser.add_argument("--source", choices=("test", "pipewire"), default="test")
+    parser.add_argument("--pipewire-node", default=os.environ.get("SUNSHINE_PIPEWIRE_NODE", "0"))
+    parser.add_argument("--width", type=int, default=int(os.environ.get("SUNSHINE_WIDTH", "1920")))
+    parser.add_argument("--height", type=int, default=int(os.environ.get("SUNSHINE_HEIGHT", "1080")))
+    parser.add_argument("--fps", type=int, default=int(os.environ.get("SUNSHINE_FPS", "60")))
+    parser.add_argument("--bitrate", type=int, default=int(os.environ.get("SUNSHINE_BITRATE_KBPS", "25000")))
+    parser.add_argument("--vbv-buffer", type=int, default=int(os.environ.get("SUNSHINE_VBV_KBITS", "25000")))
+    parser.add_argument("--payload-mtu", type=int, default=int(os.environ.get("SUNSHINE_PAYLOAD_MTU", "1200")))
+    parser.add_argument("--host", default=os.environ.get("SUNSHINE_UDP_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("SUNSHINE_UDP_PORT", "5004")))
+
+
+def build_parser():
+    default_width, default_height, default_fps, default_scale = default_geometry()
+    parser = argparse.ArgumentParser(
+        prog="arch-sunshine",
+        description="Arch Sunshine desktop runtime with a pinned Sunshine streaming server.",
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+    probe = subparsers.add_parser("probe", help="Inspect available GStreamer encoders.")
+    probe.add_argument("--config", default=os.environ.get("SUNSHINE_CONFIG", str(DEFAULT_CONFIG)))
+    probe.set_defaults(func=command_probe)
+
+    pipeline = subparsers.add_parser("pipeline", help="Print a GStreamer RTP pipeline.")
+    add_pipeline_args(pipeline)
+    pipeline.add_argument("--json", action="store_true")
+    pipeline.set_defaults(func=command_pipeline)
+
+    stream_test = subparsers.add_parser("stream-test", help="Run a test-source RTP stream over UDP.")
+    add_pipeline_args(stream_test)
+    stream_test.set_defaults(func=command_stream_test)
+
+    desktop = subparsers.add_parser("desktop-session", help="Run a full KDE Plasma desktop on the Wayland/GStreamer stack.")
+    desktop.add_argument("--runtime-dir", default=os.environ.get("XDG_RUNTIME_DIR", str(DEFAULT_RUNTIME_DIR)))
+    desktop.add_argument("--socket", default=os.environ.get("SUNSHINE_WAYLAND_SOCKET", DEFAULT_SOCKET))
+    desktop.add_argument("--width", default=default_width)
+    desktop.add_argument("--height", default=default_height)
+    desktop.add_argument("--fps", default=default_fps)
+    desktop.add_argument("--scale", default=default_scale)
+    desktop.add_argument("--ready-timeout", type=float, default=float(os.environ.get("SUNSHINE_READY_TIMEOUT", "30")))
+    desktop.add_argument("--smoke-seconds", type=float, default=0)
+    desktop.add_argument("--no-audio", action="store_true")
+    desktop.add_argument("--no-sunshine", dest="no_sunshine", action="store_true")
+    desktop.add_argument("--no-streamd", dest="no_sunshine", action="store_true", help=argparse.SUPPRESS)
+    desktop.add_argument("--no-input-bridge", action="store_true")
+    desktop.add_argument("--no-xwayland", dest="xwayland", action="store_false")
+    desktop.set_defaults(func=command_desktop_session, xwayland=True)
+
+    wayland = subparsers.add_parser("wayland-session", help="Run a command inside a headless Wayland session.")
+    wayland.add_argument("--runtime-dir", default=os.environ.get("XDG_RUNTIME_DIR", str(DEFAULT_RUNTIME_DIR)))
+    wayland.add_argument("--socket", default=os.environ.get("SUNSHINE_WAYLAND_SOCKET", DEFAULT_SOCKET))
+    wayland.add_argument("--width", type=int, default=int(os.environ.get("SUNSHINE_WIDTH", "1920")))
+    wayland.add_argument("--height", type=int, default=int(os.environ.get("SUNSHINE_HEIGHT", "1080")))
+    wayland.add_argument("app_command", nargs=argparse.REMAINDER)
+    wayland.set_defaults(func=command_wayland_session)
+
+    input_test = subparsers.add_parser("input-test", help="Verify that Linux input events reach a Wayland client in the running desktop.")
+    input_test.add_argument("--runtime-dir", default=os.environ.get("XDG_RUNTIME_DIR", str(DEFAULT_RUNTIME_DIR)))
+    input_test.add_argument("--socket", default=os.environ.get("SUNSHINE_WAYLAND_SOCKET", DEFAULT_SOCKET))
+    input_test.add_argument("--warmup-seconds", type=float, default=1.5)
+    input_test.add_argument("--hotplug-seconds", type=float, default=1.5)
+    input_test.add_argument("--timeout", type=float, default=5)
+    input_test.add_argument("--require-all", action="store_true")
+    input_test.add_argument("--verbose", action="store_true")
+    input_test.set_defaults(func=command_input_test)
+
+    client_start = subparsers.add_parser("client-start", help=argparse.SUPPRESS)
+    client_start.set_defaults(func=command_client_start)
+
+    client_stop = subparsers.add_parser("client-stop", help=argparse.SUPPRESS)
+    client_stop.set_defaults(func=command_client_stop)
+
+    disconnect = subparsers.add_parser("disconnect", help="Close the active Moonlight stream.")
+    disconnect.add_argument("--user", default=os.environ.get("SUNSHINE_WEB_UI_USER", "sunshine"))
+    disconnect.add_argument("--password", default=os.environ.get("SUNSHINE_WEB_UI_PASS", "sunshine"))
+    disconnect.set_defaults(func=command_disconnect)
+
+    session_actions = subparsers.add_parser("session-actions", help=argparse.SUPPRESS)
+    session_actions.add_argument("--user", default=os.environ.get("SUNSHINE_WEB_UI_USER", "sunshine"))
+    session_actions.add_argument("--password", default=os.environ.get("SUNSHINE_WEB_UI_PASS", "sunshine"))
+    session_actions.set_defaults(func=command_session_actions)
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "subcommand", "") == "wayland-session":
+        if args.app_command and args.app_command[0] == "--":
+            args.app_command = args.app_command[1:]
+        if not args.app_command:
+            parser.error("wayland-session requires a command after --")
+    try:
+        result = args.func(args)
+    except StreamError as exc:
+        eprint(f"arch-sunshine: {exc}")
+        return 1
+    return int(result or 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

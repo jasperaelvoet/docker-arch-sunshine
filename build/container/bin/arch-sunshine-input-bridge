@@ -1,373 +1,512 @@
 #!/usr/bin/env python3
-import errno
+import argparse
 import ctypes
+import errno
 import fcntl
 import os
 import select
 import signal
 import struct
+import sys
 import time
+from pathlib import Path
+
+import dbus
 
 
-UINPUT = "/dev/uinput"
-DEVICE_NAME = "Arch Sunshine Input Bridge"
-EVENT_SIZE = struct.calcsize("@llHHi")
+DEVICE_NAME_PREFIXES = (
+    "Mouse passthrough",
+    "Keyboard passthrough",
+    "Arch Sunshine Input Test",
+)
 
 EV_SYN = 0
 EV_KEY = 1
 EV_REL = 2
 EV_ABS = 3
-
-BUS_USB = 0x03
-KEY_MAX = 0x2FF
+SYN_REPORT = 0
 REL_X = 0
 REL_Y = 1
 REL_HWHEEL = 6
 REL_WHEEL = 8
+REL_WHEEL_HI_RES = 11
+REL_HWHEEL_HI_RES = 12
 ABS_X = 0
 ABS_Y = 1
-REL_CODES = (REL_X, REL_Y, REL_HWHEEL, REL_WHEEL)
-ABS_CODES = (ABS_X, ABS_Y)
+BTN_MOUSE = 0x110
 BTN_LEFT = 0x110
 BTN_RIGHT = 0x111
-BTN_MIDDLE = 0x112
-BTN_SIDE = 0x113
-BTN_EXTRA = 0x114
-BTN_FORWARD = 0x115
-BTN_BACK = 0x116
-BTN_TASK = 0x117
-BUTTON_CODES = {
-    BTN_LEFT: 1,
-    BTN_MIDDLE: 2,
-    BTN_RIGHT: 3,
-    BTN_SIDE: 8,
-    BTN_EXTRA: 9,
-    BTN_FORWARD: 9,
-    BTN_BACK: 8,
-    BTN_TASK: 10,
-}
+BTN_JOYSTICK = 0x120
 
-running = True
+EI_EVENT_SEAT_ADDED = 3
+EI_EVENT_DEVICE_ADDED = 5
+EI_EVENT_DEVICE_REMOVED = 6
+EI_EVENT_DEVICE_PAUSED = 7
+EI_EVENT_DEVICE_RESUMED = 8
 
+EI_CAP_POINTER = 1 << 0
+EI_CAP_POINTER_ABSOLUTE = 1 << 1
+EI_CAP_KEYBOARD = 1 << 2
+EI_CAP_SCROLL = 1 << 4
+EI_CAP_BUTTON = 1 << 5
 
-def ioc(direction, type_, number, size):
-    return (
-        (direction << 30)
-        | (ord(type_) << 8)
-        | number
-        | (size << 16)
-    )
+PORTAL_DEVICE_KEYBOARD = 1 << 0
+PORTAL_DEVICE_POINTER = 1 << 1
+PORTAL_DEVICE_TOUCHSCREEN = 1 << 2
+PORTAL_DEVICE_ALL = PORTAL_DEVICE_KEYBOARD | PORTAL_DEVICE_POINTER | PORTAL_DEVICE_TOUCHSCREEN
+
+INPUT_EVENT = struct.Struct("llHHi")
+ABS_INFO = struct.Struct("iiiiii")
+EVIOCGABS_BASE = (2 << 30) | (ABS_INFO.size << 16) | (ord("E") << 8) | 0x40
 
 
-def iow(type_, number, size):
-    return ioc(1, type_, number, size)
+def log(message):
+    print(f"arch-sunshine-input-bridge: {message}", flush=True)
 
 
-UI_DEV_CREATE = ioc(0, "U", 1, 0)
-UI_DEV_DESTROY = ioc(0, "U", 2, 0)
-UI_SET_EVBIT = iow("U", 100, struct.calcsize("i"))
-UI_SET_KEYBIT = iow("U", 101, struct.calcsize("i"))
-UI_SET_RELBIT = iow("U", 102, struct.calcsize("i"))
-UI_SET_ABSBIT = iow("U", 103, struct.calcsize("i"))
+def load_libei():
+    lib = ctypes.CDLL("libei.so.1")
+    lib.ei_new_sender.argtypes = [ctypes.c_void_p]
+    lib.ei_new_sender.restype = ctypes.c_void_p
+    lib.ei_configure_name.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    lib.ei_setup_backend_fd.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.ei_setup_backend_fd.restype = ctypes.c_int
+    lib.ei_get_fd.argtypes = [ctypes.c_void_p]
+    lib.ei_get_fd.restype = ctypes.c_int
+    lib.ei_dispatch.argtypes = [ctypes.c_void_p]
+    lib.ei_get_event.argtypes = [ctypes.c_void_p]
+    lib.ei_get_event.restype = ctypes.c_void_p
+    lib.ei_event_get_type.argtypes = [ctypes.c_void_p]
+    lib.ei_event_get_type.restype = ctypes.c_int
+    lib.ei_event_get_seat.argtypes = [ctypes.c_void_p]
+    lib.ei_event_get_seat.restype = ctypes.c_void_p
+    lib.ei_event_get_device.argtypes = [ctypes.c_void_p]
+    lib.ei_event_get_device.restype = ctypes.c_void_p
+    lib.ei_event_unref.argtypes = [ctypes.c_void_p]
+    lib.ei_seat_bind_capabilities.argtypes = [ctypes.c_void_p]
+    lib.ei_device_ref.argtypes = [ctypes.c_void_p]
+    lib.ei_device_ref.restype = ctypes.c_void_p
+    lib.ei_device_unref.argtypes = [ctypes.c_void_p]
+    lib.ei_device_has_capability.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.ei_device_has_capability.restype = ctypes.c_bool
+    lib.ei_device_start_emulating.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    lib.ei_device_stop_emulating.argtypes = [ctypes.c_void_p]
+    lib.ei_device_pointer_motion.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_double]
+    lib.ei_device_pointer_motion_absolute.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_double]
+    lib.ei_device_button_button.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_bool]
+    lib.ei_device_scroll_discrete.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32]
+    lib.ei_device_keyboard_key.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_bool]
+    lib.ei_device_frame.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+    lib.ei_now.argtypes = [ctypes.c_void_p]
+    lib.ei_now.restype = ctypes.c_uint64
+    lib.ei_unref.argtypes = [ctypes.c_void_p]
+    lib.ei_unref.restype = ctypes.c_void_p
+    lib.ei_device_get_region.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.ei_device_get_region.restype = ctypes.c_void_p
+    lib.ei_region_get_x.argtypes = [ctypes.c_void_p]
+    lib.ei_region_get_x.restype = ctypes.c_uint32
+    lib.ei_region_get_y.argtypes = [ctypes.c_void_p]
+    lib.ei_region_get_y.restype = ctypes.c_uint32
+    lib.ei_region_get_width.argtypes = [ctypes.c_void_p]
+    lib.ei_region_get_width.restype = ctypes.c_uint32
+    lib.ei_region_get_height.argtypes = [ctypes.c_void_p]
+    lib.ei_region_get_height.restype = ctypes.c_uint32
+    return lib
 
 
-def stop(_signum, _frame):
-    global running
-    running = False
+class EisSender:
+    def __init__(self):
+        self.lib = load_libei()
+        self.bus = None
+        self.iface = None
+        self.cookie = None
+        self.ei = None
+        self.fd = None
+        self.devices = []
+        self.sequence = 1
+        self.pointer = None
+        self.pointer_abs = None
+        self.button = None
+        self.scroll = None
+        self.keyboard = None
+        self.abs_region = (0, 0, 1920, 1080)
+
+    def connect(self):
+        self.bus = dbus.SessionBus()
+        self.iface = dbus.Interface(
+            self.bus.get_object("org.kde.KWin", "/org/kde/KWin/EIS/RemoteDesktop"),
+            "org.kde.KWin.EIS.RemoteDesktop",
+        )
+        fd_object, self.cookie = self.iface.connectToEIS(dbus.Int32(PORTAL_DEVICE_ALL))
+        fd = fd_object.take()
+
+        self.ei = self.lib.ei_new_sender(None)
+        if not self.ei:
+            os.close(fd)
+            raise RuntimeError("failed to create libei sender")
+        self.lib.ei_configure_name(self.ei, b"arch-sunshine-input-bridge")
+        result = self.lib.ei_setup_backend_fd(self.ei, fd)
+        if result != 0:
+            raise OSError(-result, os.strerror(-result))
+        self.fd = self.lib.ei_get_fd(self.ei)
+        self.pump(3.0)
+        if not (self.keyboard or self.pointer or self.pointer_abs or self.button):
+            raise RuntimeError("KWin EIS did not expose any input devices")
+
+    def close(self):
+        if self.iface is not None and self.cookie is not None:
+            try:
+                self.iface.disconnect(self.cookie)
+            except Exception:
+                pass
+        for device in self.devices:
+            try:
+                self.lib.ei_device_unref(device)
+            except Exception:
+                pass
+        self.devices = []
+        if self.ei is not None:
+            self.lib.ei_unref(self.ei)
+        self.ei = None
+        self.fd = None
+        self.cookie = None
+
+    def pump(self, timeout=0.0):
+        deadline = time.monotonic() + timeout
+        while True:
+            wait = max(0.0, min(0.05, deadline - time.monotonic()))
+            if self.fd is not None:
+                readable, _, _ = select.select([self.fd], [], [], wait)
+                if readable:
+                    self.lib.ei_dispatch(self.ei)
+            self._drain_events()
+            if time.monotonic() >= deadline:
+                break
+
+    def _drain_events(self):
+        while True:
+            event = self.lib.ei_get_event(self.ei)
+            if not event:
+                return
+            try:
+                event_type = self.lib.ei_event_get_type(event)
+                if event_type == EI_EVENT_SEAT_ADDED:
+                    seat = self.lib.ei_event_get_seat(event)
+                    self.lib.ei_seat_bind_capabilities(
+                        seat,
+                        ctypes.c_int(EI_CAP_POINTER),
+                        ctypes.c_int(EI_CAP_POINTER_ABSOLUTE),
+                        ctypes.c_int(EI_CAP_KEYBOARD),
+                        ctypes.c_int(EI_CAP_SCROLL),
+                        ctypes.c_int(EI_CAP_BUTTON),
+                        ctypes.c_int(0),
+                    )
+                elif event_type == EI_EVENT_DEVICE_ADDED:
+                    device = self.lib.ei_event_get_device(event)
+                    self.lib.ei_device_ref(device)
+                    self.devices.append(device)
+                    self._classify_device(device)
+                elif event_type == EI_EVENT_DEVICE_RESUMED:
+                    device = self.lib.ei_event_get_device(event)
+                    self.lib.ei_device_start_emulating(device, self.sequence)
+                    self.sequence = (self.sequence + 1) & 0xFFFFFFFF
+                    if self.sequence == 0:
+                        self.sequence = 1
+                elif event_type == EI_EVENT_DEVICE_PAUSED:
+                    pass
+                elif event_type == EI_EVENT_DEVICE_REMOVED:
+                    self._classify_all_devices()
+            finally:
+                self.lib.ei_event_unref(event)
+
+    def _classify_device(self, device):
+        if self.lib.ei_device_has_capability(device, EI_CAP_POINTER):
+            self.pointer = device
+        if self.lib.ei_device_has_capability(device, EI_CAP_POINTER_ABSOLUTE):
+            self.pointer_abs = device
+            region = self.lib.ei_device_get_region(device, 0)
+            if region:
+                self.abs_region = (
+                    int(self.lib.ei_region_get_x(region)),
+                    int(self.lib.ei_region_get_y(region)),
+                    int(self.lib.ei_region_get_width(region)),
+                    int(self.lib.ei_region_get_height(region)),
+                )
+        if self.lib.ei_device_has_capability(device, EI_CAP_BUTTON):
+            self.button = device
+        if self.lib.ei_device_has_capability(device, EI_CAP_SCROLL):
+            self.scroll = device
+        if self.lib.ei_device_has_capability(device, EI_CAP_KEYBOARD):
+            self.keyboard = device
+
+    def _classify_all_devices(self):
+        self.pointer = None
+        self.pointer_abs = None
+        self.button = None
+        self.scroll = None
+        self.keyboard = None
+        for device in self.devices:
+            self._classify_device(device)
+
+    def frame(self, device):
+        if device:
+            self.lib.ei_device_frame(device, self.lib.ei_now(self.ei))
+            self.lib.ei_dispatch(self.ei)
+            self.pump(0.0)
+
+    def move_relative(self, dx, dy):
+        if self.pointer and (dx or dy):
+            self.lib.ei_device_pointer_motion(self.pointer, float(dx), float(dy))
+            self.frame(self.pointer)
+
+    def move_absolute(self, x, y, source_ranges):
+        if not self.pointer_abs:
+            return
+        min_x, max_x, min_y, max_y = source_ranges
+        region_x, region_y, width, height = self.abs_region
+        if max_x <= min_x or max_y <= min_y or width <= 0 or height <= 0:
+            return
+        target_x = region_x + ((x - min_x) / (max_x - min_x)) * max(0, width - 1)
+        target_y = region_y + ((y - min_y) / (max_y - min_y)) * max(0, height - 1)
+        self.lib.ei_device_pointer_motion_absolute(self.pointer_abs, float(target_x), float(target_y))
+        self.frame(self.pointer_abs)
+
+    def button_event(self, code, pressed):
+        if self.button:
+            self.lib.ei_device_button_button(self.button, int(code), bool(pressed))
+            self.frame(self.button)
+
+    def scroll_event(self, dx, dy):
+        if self.scroll and (dx or dy):
+            self.lib.ei_device_scroll_discrete(self.scroll, int(dx), int(dy))
+            self.frame(self.scroll)
+
+    def key_event(self, code, pressed):
+        if self.keyboard:
+            self.lib.ei_device_keyboard_key(self.keyboard, int(code), bool(pressed))
+            self.frame(self.keyboard)
 
 
-def ioctl_int(fd, request, value):
-    fcntl.ioctl(fd, request, value)
-
-
-def create_uinput_device():
-    fd = os.open(UINPUT, os.O_WRONLY | os.O_NONBLOCK)
-
-    for ev_type in (EV_KEY, EV_REL, EV_ABS):
-        ioctl_int(fd, UI_SET_EVBIT, ev_type)
-
-    for code in range(KEY_MAX + 1):
-        ioctl_int(fd, UI_SET_KEYBIT, code)
-    for code in REL_CODES:
-        ioctl_int(fd, UI_SET_RELBIT, code)
-    for code in ABS_CODES:
-        ioctl_int(fd, UI_SET_ABSBIT, code)
-
-    absmax = [0] * 64
-    absmin = [0] * 64
-    absfuzz = [0] * 64
-    absflat = [0] * 64
-    absmax[0] = 65535
-    absmax[1] = 65535
-
-    payload = struct.pack(
-        "@80sHHHHI",
-        DEVICE_NAME.encode("utf-8"),
-        BUS_USB,
-        0xBEEF,
-        0xB00F,
-        1,
-        0,
-    )
-    payload += struct.pack("@64i", *absmax)
-    payload += struct.pack("@64i", *absmin)
-    payload += struct.pack("@64i", *absfuzz)
-    payload += struct.pack("@64i", *absflat)
-
-    os.write(fd, payload)
-    fcntl.ioctl(fd, UI_DEV_CREATE)
-    return fd
-
-
-def passthrough_event_paths():
-    try:
-        data = open("/proc/bus/input/devices", encoding="utf-8").read()
-    except OSError:
-        return []
-
-    paths = []
-    for block in data.strip().split("\n\n"):
-        if "passthrough" not in block or DEVICE_NAME in block:
-            continue
-        for line in block.splitlines():
-            if not line.startswith("H: Handlers="):
-                continue
-            for token in line.split():
-                if token.startswith("event"):
-                    paths.append(f"/dev/input/{token}")
-    return sorted(set(paths))
-
-
-def open_sources(existing):
-    for path in passthrough_event_paths():
-        if path in existing:
-            continue
-        try:
-            existing[path] = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-            print(f"forwarding {path}", flush=True)
-        except OSError:
-            pass
-
-
-class XTestInjector:
-    def __init__(self, display_name):
-        self.x11 = ctypes.CDLL("libX11.so.6")
-        self.xtst = ctypes.CDLL("libXtst.so.6")
-
-        self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
-        self.x11.XOpenDisplay.restype = ctypes.c_void_p
-        self.x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
-        self.x11.XDefaultScreen.restype = ctypes.c_int
-        self.x11.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        self.x11.XDisplayWidth.restype = ctypes.c_int
-        self.x11.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
-        self.x11.XDisplayHeight.restype = ctypes.c_int
-        self.x11.XFlush.argtypes = [ctypes.c_void_p]
-        self.x11.XFlush.restype = ctypes.c_int
-
-        self.xtst.XTestFakeMotionEvent.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_ulong,
-        ]
-        self.xtst.XTestFakeMotionEvent.restype = ctypes.c_int
-        self.xtst.XTestFakeRelativeMotionEvent.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_ulong,
-        ]
-        self.xtst.XTestFakeRelativeMotionEvent.restype = ctypes.c_int
-        self.xtst.XTestFakeButtonEvent.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint,
-            ctypes.c_int,
-            ctypes.c_ulong,
-        ]
-        self.xtst.XTestFakeButtonEvent.restype = ctypes.c_int
-        self.xtst.XTestFakeKeyEvent.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint,
-            ctypes.c_int,
-            ctypes.c_ulong,
-        ]
-        self.xtst.XTestFakeKeyEvent.restype = ctypes.c_int
-
-        self.display = self.x11.XOpenDisplay(display_name.encode("utf-8"))
-        if not self.display:
-            raise RuntimeError(f"could not open X display {display_name}")
-        self.screen = self.x11.XDefaultScreen(self.display)
-        self.width = 1
-        self.height = 1
-        self.abs_x = None
-        self.abs_y = None
+class InputDevice:
+    def __init__(self, path, name):
+        self.path = Path(path)
+        self.name = name
+        self.swap_primary_buttons = should_swap_primary_buttons(name)
+        self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         self.rel_x = 0
         self.rel_y = 0
-        self.refresh_size()
+        self.scroll_x = 0
+        self.scroll_y = 0
+        self.abs_x = None
+        self.abs_y = None
+        self.abs_ranges = {
+            ABS_X: self._abs_info(ABS_X),
+            ABS_Y: self._abs_info(ABS_Y),
+        }
 
-    def refresh_size(self):
-        self.width = max(1, self.x11.XDisplayWidth(self.display, self.screen))
-        self.height = max(1, self.x11.XDisplayHeight(self.display, self.screen))
+    def close(self):
+        os.close(self.fd)
 
-    def fake_button(self, button, pressed):
-        self.xtst.XTestFakeButtonEvent(self.display, button, int(pressed), 0)
-
-    def fake_key(self, evdev_code, pressed):
-        # Xwayland uses the standard evdev + 8 keycode offset for normal keys.
-        keycode = evdev_code + 8
-        if 8 <= keycode <= 255:
-            self.xtst.XTestFakeKeyEvent(self.display, keycode, int(pressed), 0)
-
-    def fake_wheel(self, positive_button, negative_button, value):
-        button = positive_button if value > 0 else negative_button
-        for _ in range(abs(value)):
-            self.fake_button(button, True)
-            self.fake_button(button, False)
-
-    def handle_event(self, event):
-        _sec, _usec, ev_type, code, value = event
-
-        if ev_type == EV_SYN:
-            self.flush()
-            return
-
-        if ev_type == EV_KEY:
-            if code in BUTTON_CODES:
-                self.fake_button(BUTTON_CODES[code], value != 0)
-            else:
-                self.fake_key(code, value != 0)
-            return
-
-        if ev_type == EV_REL:
-            if code == REL_X:
-                self.rel_x += value
-            elif code == REL_Y:
-                self.rel_y += value
-            elif code == REL_WHEEL:
-                self.fake_wheel(4, 5, value)
-            elif code == REL_HWHEEL:
-                self.fake_wheel(7, 6, value)
-            return
-
-        if ev_type == EV_ABS:
-            if code == ABS_X:
-                self.abs_x = max(0, min(65535, value))
-            elif code == ABS_Y:
-                self.abs_y = max(0, min(65535, value))
-
-    def flush(self):
-        if self.abs_x is not None and self.abs_y is not None:
-            self.refresh_size()
-            x = round(self.abs_x * (self.width - 1) / 65535)
-            y = round(self.abs_y * (self.height - 1) / 65535)
-            self.xtst.XTestFakeMotionEvent(self.display, self.screen, x, y, 0)
-
-        if self.rel_x or self.rel_y:
-            self.xtst.XTestFakeRelativeMotionEvent(
-                self.display,
-                self.rel_x,
-                self.rel_y,
-                0,
-            )
-            self.rel_x = 0
-            self.rel_y = 0
-
-        self.x11.XFlush(self.display)
-
-
-def event_is_supported(event):
-    _sec, _usec, ev_type, code, _value = event
-    if ev_type == EV_SYN:
-        return True
-    if ev_type == EV_KEY:
-        return 0 <= code <= KEY_MAX
-    if ev_type == EV_REL:
-        return code in REL_CODES
-    if ev_type == EV_ABS:
-        return code in ABS_CODES
-    return False
-
-
-def forward_events(sources, handler):
-    if not sources:
-        time.sleep(0.1)
-        return
-
-    ready, _, _ = select.select(list(sources.values()), [], [], 0.25)
-    fd_to_path = {fd: path for path, fd in sources.items()}
-
-    for source_fd in ready:
-        path = fd_to_path[source_fd]
+    def _abs_info(self, code):
         try:
-            data = os.read(source_fd, EVENT_SIZE * 64)
-        except OSError as exc:
-            if exc.errno in (errno.ENODEV, errno.ENXIO, errno.EBADF):
-                os.close(source_fd)
-                sources.pop(path, None)
-            continue
+            data = fcntl.ioctl(self.fd, EVIOCGABS_BASE + code, bytes(ABS_INFO.size))
+            _value, minimum, maximum, _fuzz, _flat, _resolution = ABS_INFO.unpack(data)
+            return minimum, maximum
+        except OSError:
+            return 0, 65535
 
-        for offset in range(0, len(data) - (len(data) % EVENT_SIZE), EVENT_SIZE):
-            chunk = data[offset : offset + EVENT_SIZE]
-            event = struct.unpack("@llHHi", chunk)
-            if event_is_supported(event):
-                handler(chunk, event)
+    def source_ranges(self):
+        min_x, max_x = self.abs_ranges[ABS_X]
+        min_y, max_y = self.abs_ranges[ABS_Y]
+        return min_x, max_x, min_y, max_y
+
+    def read_events(self):
+        events = []
+        while True:
+            try:
+                data = os.read(self.fd, INPUT_EVENT.size * 64)
+            except BlockingIOError:
+                return events
+            except OSError as exc:
+                if exc.errno in (errno.ENODEV, errno.EIO):
+                    raise
+                return events
+            if not data:
+                return events
+            for offset in range(0, len(data) - (len(data) % INPUT_EVENT.size), INPUT_EVENT.size):
+                events.append(INPUT_EVENT.unpack(data[offset : offset + INPUT_EVENT.size]))
 
 
-def wait_for_xtest_display(display_name):
-    while running:
-        try:
-            return XTestInjector(display_name)
-        except RuntimeError as exc:
-            print(str(exc), flush=True)
-            time.sleep(0.5)
-    raise RuntimeError("stopped before XTEST display was available")
+class DeviceSet:
+    def __init__(self):
+        self.devices = {}
+        self.last_scan = 0.0
 
+    def close(self):
+        for device in list(self.devices.values()):
+            device.close()
+        self.devices.clear()
 
-def run_xtest_bridge():
-    display_name = os.environ.get("DISPLAY", ":99")
-    injector = wait_for_xtest_display(display_name)
-    sources = {}
-    last_scan = 0.0
-    print(f"injecting XTEST events into {display_name}", flush=True)
-
-    while running:
+    def scan(self, force=False):
         now = time.monotonic()
-        if now - last_scan >= 0.5:
-            open_sources(sources)
-            last_scan = now
-        forward_events(sources, lambda _chunk, event: injector.handle_event(event))
+        if not force and now - self.last_scan < 0.5:
+            return
+        self.last_scan = now
+        seen = set()
+        for event_path in sorted(Path("/dev/input").glob("event*")):
+            name = input_name(event_path.name)
+            if not name or not wanted_device(name):
+                continue
+            seen.add(str(event_path))
+            if str(event_path) in self.devices:
+                continue
+            try:
+                self.devices[str(event_path)] = InputDevice(str(event_path), name)
+                suffix = " primary buttons swapped" if self.devices[str(event_path)].swap_primary_buttons else ""
+                log(f"watching {event_path} ({name}){suffix}")
+            except OSError as exc:
+                log(f"could not open {event_path}: {exc}")
+        for path in list(self.devices):
+            if path not in seen or not Path(path).exists():
+                self.devices[path].close()
+                del self.devices[path]
+
+    def fds(self):
+        return [device.fd for device in self.devices.values()]
+
+    def by_fd(self):
+        return {device.fd: device for device in self.devices.values()}
 
 
-def run_uinput_bridge():
-    uinput_fd = create_uinput_device()
-    sources = {}
-    last_scan = 0.0
-
+def input_name(event_name):
+    path = Path("/sys/class/input") / event_name / "device" / "name"
     try:
-        while running:
-            now = time.monotonic()
-            if now - last_scan >= 0.5:
-                open_sources(sources)
-                last_scan = now
-            forward_events(sources, lambda chunk, _event: os.write(uinput_fd, chunk))
-    finally:
-        for fd in sources.values():
-            os.close(fd)
-        fcntl.ioctl(uinput_fd, UI_DEV_DESTROY)
-        os.close(uinput_fd)
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
-def main():
+def wanted_device(name):
+    return any(name.startswith(prefix) for prefix in DEVICE_NAME_PREFIXES)
+
+
+def env_truthy(name, default):
+    value = os.environ.get(name, default).strip().lower()
+    return value not in ("", "0", "false", "no", "off")
+
+
+def should_swap_primary_buttons(name):
+    if not name.startswith("Mouse passthrough"):
+        return False
+    return env_truthy("SUNSHINE_SWAP_PRIMARY_MOUSE_BUTTONS", "1")
+
+
+def flush_device(device, eis):
+    if device.rel_x or device.rel_y:
+        eis.move_relative(device.rel_x, device.rel_y)
+        device.rel_x = 0
+        device.rel_y = 0
+    if device.abs_x is not None and device.abs_y is not None:
+        eis.move_absolute(device.abs_x, device.abs_y, device.source_ranges())
+    if device.scroll_x or device.scroll_y:
+        eis.scroll_event(device.scroll_x, device.scroll_y)
+        device.scroll_x = 0
+        device.scroll_y = 0
+
+
+def handle_event(device, event, eis):
+    _seconds, _useconds, event_type, code, value = event
+    if event_type == EV_REL:
+        if code == REL_X:
+            device.rel_x += value
+        elif code == REL_Y:
+            device.rel_y += value
+        elif code == REL_HWHEEL_HI_RES:
+            device.scroll_x += value
+        elif code == REL_WHEEL_HI_RES:
+            device.scroll_y -= value
+        elif code == REL_HWHEEL:
+            device.scroll_x += value * 120
+        elif code == REL_WHEEL:
+            device.scroll_y -= value * 120
+    elif event_type == EV_ABS:
+        if code == ABS_X:
+            device.abs_x = value
+        elif code == ABS_Y:
+            device.abs_y = value
+    elif event_type == EV_KEY:
+        if code >= BTN_MOUSE and code < BTN_JOYSTICK:
+            if value in (0, 1):
+                if device.swap_primary_buttons:
+                    if code == BTN_LEFT:
+                        code = BTN_RIGHT
+                    elif code == BTN_RIGHT:
+                        code = BTN_LEFT
+                eis.button_event(code, value == 1)
+        else:
+            if value in (0, 1):
+                eis.key_event(code, value == 1)
+    elif event_type == EV_SYN and code == SYN_REPORT:
+        flush_device(device, eis)
+
+
+def command_serve(args):
+    stopping = False
+
+    def stop(_signum, _frame):
+        nonlocal stopping
+        stopping = True
+
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
 
-    if os.environ.get("ARCH_SUNSHINE_INPUT_MODE") == "xtest":
-        run_xtest_bridge()
-    else:
-        run_uinput_bridge()
+    while not stopping:
+        eis = EisSender()
+        devices = DeviceSet()
+        try:
+            eis.connect()
+            log("connected to KWin EIS")
+            devices.scan(force=True)
+            while not stopping:
+                eis.pump(0.0)
+                devices.scan()
+                fd_map = devices.by_fd()
+                wait_fds = list(fd_map)
+                if not wait_fds:
+                    time.sleep(0.1)
+                    continue
+                readable, _, _ = select.select(wait_fds, [], [], 0.1)
+                for fd in readable:
+                    device = fd_map.get(fd)
+                    if not device:
+                        continue
+                    try:
+                        for event in device.read_events():
+                            handle_event(device, event, eis)
+                    except OSError:
+                        devices.scan(force=True)
+        except Exception as exc:
+            log(f"bridge error: {exc}")
+            if args.exit_on_error:
+                return 1
+            time.sleep(1)
+        finally:
+            devices.close()
+            eis.close()
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Bridge Sunshine evdev passthrough input into KWin EIS.")
+    parser.add_argument("--exit-on-error", action="store_true")
+    parser.set_defaults(func=command_serve)
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    return int(args.func(args) or 0)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

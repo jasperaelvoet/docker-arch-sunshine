@@ -1,3 +1,5 @@
+name: docker-arch-sunshine
+
 services:
   sunshine:
     build:

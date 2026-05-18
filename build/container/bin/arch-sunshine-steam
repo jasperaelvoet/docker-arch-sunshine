@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STEAM_REAL="${ARCH_SUNSHINE_STEAM_REAL:-/usr/bin/steam}"
+STEAM_REAL="${SUNSHINE_STEAM_REAL:-/usr/bin/steam}"
 STEAM_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/Steam"
 STEAM_BOOTSTRAP_TAR=/usr/share/arch-sunshine/steam/bootstraplinux_ubuntu12_32.tar.xz
 STEAM_DEV_CFG="${HOME}/.steam/steam/steam_dev.cfg"

@@ -1,27 +1,29 @@
 # Docker Arch Sunshine
 
-Arch Linux desktop container for Moonlight game streaming through Sunshine. It
-runs KDE Plasma with Steam and Firefox, persists user data locally, and is set up
-for GPU-backed desktop capture on headless Linux hosts.
+Arch Linux desktop container for a full KDE Plasma Wayland desktop streamed to
+Moonlight through Sunshine.
 
-## What's included
+## What's Included
 
-- Arch Linux desktop with KDE Plasma
-- Sunshine host for Moonlight pairing and streaming
+- KDE Plasma Wayland desktop on a virtual KWin output
+- Pinned Sunshine release package installed in the image
+- Container-native Sunshine wrapper at `arch-sunshine-server`
+- Sunshine KWin/Wayland, KMS, portal, X11, VAAPI, and Vulkan capture/encode support
+- GStreamer RTP pipeline generation and live stream smoke tests for local probing
+- H.264, HEVC, and AV1 encoder probing
+- NVENC, VAAPI, QSV, and software encoder definitions
+- PipeWire/PulseAudio session audio with an `arch_sunshine_audio` virtual sink
 - Steam and Firefox launchers
-- PipeWire/PulseAudio audio capture for streams
-- Persistent desktop, Steam, and Sunshine state in `./mnt/user_data`
-- Stream-triggered desktop wake/sleep so idle containers keep only Sunshine and
-  a lightweight X11 capture display up
-- Plasma Disconnect launcher for closing the Moonlight stream and sleeping the
-  desktop session
+- Original Sunshine app list: Desktop
+- Stream-triggered client resizing from Moonlight width, height, FPS, and scale
+- Disconnect launcher for closing the active Moonlight stream
+- Single persistent mount model: `./mnt/user_data` to `/mnt/user_data`
 
 ## Requirements
 
 - Docker with the Compose plugin
-- Linux host with GPU devices exposed at `/dev/dri`
-- `/dev/uinput` and `/dev/uhid` available for input/controller passthrough
-- Host networking available for Sunshine and Moonlight discovery
+- Linux host with GPU devices exposed at `/dev/dri` for hardware rendering and encoding
+- `/dev/uinput` and `/dev/uhid` for Sunshine keyboard, mouse, and controller input
 
 ## Usage
 
@@ -29,24 +31,52 @@ for GPU-backed desktop capture on headless Linux hosts.
 make dev
 ```
 
-This builds the image, starts the container, and attaches to the terminal control
-UI. Pair from Moonlight, then press `p` in the control UI to enter the pairing
-PIN.
-
-## Published Image
-
-Every push to `main` publishes the container to GitHub Container Registry:
-
-```sh
-docker pull ghcr.io/jasperaelvoet/docker-arch-sunshine:latest
-```
+This builds the image, starts the `arch-sunshine desktop-session` runtime, and
+attaches to the container. The runtime starts KDE first, then runs Sunshine
+inside that same Wayland, D-Bus, and PipeWire session.
 
 ## Commands
 
 ```sh
-make dev    # build, start, and attach
-make clean  # stop and remove persisted local data
+make dev      # build, start, and attach
+make clean    # stop and remove persisted local data
 ```
+
+Inside the container:
+
+```sh
+arch-sunshine probe
+arch-sunshine desktop-session
+arch-sunshine input-test --require-all
+arch-sunshine-server pin 1234
+arch-sunshine pipeline --codec h264 --width 1920 --height 1080 --fps 60
+arch-sunshine stream-test --codec h264 --host 127.0.0.1 --port 5004
+arch-sunshine stream-test --codec hevc --host 127.0.0.1 --port 5006
+arch-sunshine stream-test --codec av1 --host 127.0.0.1 --port 5008
+```
+
+When Moonlight asks for pairing, attach to the container UI and press `r`, then
+enter the PIN shown by Moonlight. Sunshine persists its TLS identity, paired
+client records, generated config, and app list under `/mnt/user_data`.
+
+## Defaults
+
+- Image/container: `docker-arch-sunshine`
+- Desktop user: `sunshine`
+- Desktop password: `sunshine`
+- Persistent data: `./mnt/user_data`
+- Wayland socket: `/run/user/1000/arch-sunshine-wayland`
+- Desktop size: `SUNSHINE_WIDTH` x `SUNSHINE_HEIGHT`, default `1920x1080`
+- Desktop scale: `SUNSHINE_SCALE`, default `auto`
+- Sunshine HTTP/HTTPS ports: `47989` / `47984`
+- Sunshine RTSP/media/control ports: `48010`, `47998`, `48000`, `47999`
+- Sunshine capture: `SUNSHINE_CAPTURE`, default `kwin`; set `auto` to let Sunshine choose
+- Sunshine encoder: `SUNSHINE_ENCODER`, default auto
+
+Runtime package changes are intentionally blocked. Add or remove system packages
+in `build/container/Dockerfile`, then rebuild the image. Steam is seeded from
+the packaged bootstrap into persistent user data on first start; client updates
+and shader cache state stay under `/mnt/user_data`.
 
 ## Remote Host
 
@@ -66,33 +96,5 @@ Override the target if needed:
 make remote-dev REMOTE=root@10.10.10.122 REMOTE_DIR=/root/docker-games
 ```
 
-## Defaults
-
-- Image/container: `docker-arch-sunshine`
-- Desktop user: `sunshine`
-- Desktop password: `sunshine`
-- Sunshine Web UI: `https://<host-ip>:47990`
-- Web UI login: `sunshine` / `sunshine`
-- Persistent data: `./mnt/user_data`
-
-Runtime system changes are intentionally blocked. The container creates its own
-ephemeral writable runtime mounts, then remounts the root filesystem read-only
-when the Docker host supports it. On hosts that reject root overlay remounts,
-the entrypoint falls back to read-only system path mounts for package and OS
-state. User/session data stays under `/mnt/user_data`. Add or remove system
-packages in `build/container/Dockerfile`, then rebuild the image.
-Steam is seeded from the packaged bootstrap into persistent user data on first
-start; client updates and shader cache state stay under `/mnt/user_data`.
-
-The container uses the mounted GPU when available. On a headless GPU it runs
-KDE Plasma on GPU-backed Xwayland so Sunshine can still capture an X11 desktop.
-The lightweight X11 capture display stays up so Sunshine can initialize streams.
-KDE Plasma, audio, input bridge, and user applications are started by Sunshine
-when a Moonlight app starts, sized from the client's requested width, height, and
-FPS where the active display backend supports it, then stopped again when the app
-ends. Plasma scaling defaults to `auto`, derived from the requested stream
-resolution, and can be overridden with `SUNSHINE_SCALE` such as `1`, `1.5`, or
-`2`. The fallback capture display defaults to 1920x1080 before a client request
-is available, and can be overridden with `SUNSHINE_WIDTH` and `SUNSHINE_HEIGHT`.
-Plasma's lock and logout actions are hidden; use the Disconnect launcher on the
-desktop or panel to close a Moonlight session.
+See `docs/wayland-gstreamer-stack.md` for the target architecture and remaining
+protocol milestones.
