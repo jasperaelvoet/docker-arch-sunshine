@@ -27,7 +27,7 @@ DESKTOP_GID = 1000
 HOME_DIR = Path(f"/home/{DESKTOP_USER}")
 PERSISTENT_HOME_DIR = USER_DATA / "home" / DESKTOP_USER
 LOG_DIR = USER_DATA / "var" / "log" / "arch-sunshine"
-SUNSHINE_CONFIG_DIR = USER_DATA / "etc" / "sunshine"
+SUNSHINE_CONFIG_DIR = Path("/run/arch-sunshine/sunshine")
 SUNSHINE_STATE_DIR = USER_DATA / "var" / "lib" / "sunshine"
 DEFAULT_RUNTIME_DIR = Path("/run/user/1000")
 DEFAULT_SOCKET = "arch-sunshine-wayland"
@@ -337,7 +337,6 @@ def prepare_desktop_filesystem(runtime_dir):
     bind_persistent_home()
     chown_path(PERSISTENT_HOME_DIR, recursive=True)
     chown_path(LOG_DIR, recursive=True)
-    chown_path(SUNSHINE_CONFIG_DIR, recursive=True)
     chown_path(SUNSHINE_STATE_DIR, recursive=True)
     chown_path(runtime_dir)
     runtime_dir.chmod(0o700)
@@ -471,6 +470,16 @@ def cleanup_kickoff_launcher_config(path):
     path.write_text("\n".join(fixed) + "\n", encoding="utf-8")
 
 
+def clear_kde_service_cache():
+    for path in (HOME_DIR / ".cache").glob("ksycoca6*"):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except IsADirectoryError:
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def env_args(env):
     return [f"{key}={value}" for key, value in env.items()]
 
@@ -527,6 +536,18 @@ def start_as_desktop_user(command, env, log_name):
     log_handle = log_path.open("ab", buffering=0)
     process = subprocess.Popen(
         ["runuser", "-u", DESKTOP_USER, "--", "env", *env_args(env), *command],
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+    )
+    process._arch_sunshine_log_handle = log_handle
+    return process
+
+
+def start_with_env(command, env, log_name):
+    log_path = LOG_DIR / log_name
+    log_handle = log_path.open("ab", buffering=0)
+    process = subprocess.Popen(
+        ["env", *env_args(env), *command],
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )
@@ -1445,6 +1466,7 @@ def start_desktop_stack(args, runtime_dir, socket_path, compositor_env, desktop_
     apply_kde_scale_config(desktop_env, state["width"], state["height"], state["fps"], state["scale"], live=True)
     run_as_desktop_user(["xdg-user-dirs-update"], desktop_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     apply_kde_session_tweaks(desktop_env)
+    clear_kde_service_cache()
     with (LOG_DIR / "kbuildsycoca.log").open("ab") as log_handle:
         run_as_desktop_user(["kbuildsycoca6", "--noincremental"], desktop_env, stdout=log_handle, stderr=subprocess.STDOUT)
 
@@ -1664,7 +1686,7 @@ def command_desktop_session(args):
         start_desktop_stack(args, runtime_dir, socket_path, compositor_env, desktop_env, state)
 
         if not args.no_sunshine:
-            sunshine = start_as_desktop_user(
+            sunshine = start_with_env(
                 ["/usr/local/bin/arch-sunshine-server", "serve"],
                 desktop_env,
                 "sunshine-wrapper.log",

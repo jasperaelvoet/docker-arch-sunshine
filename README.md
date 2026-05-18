@@ -56,8 +56,9 @@ arch-sunshine stream-test --codec av1 --host 127.0.0.1 --port 5008
 ```
 
 When Moonlight asks for pairing, attach to the container UI and press `r`, then
-enter the PIN shown by Moonlight. Sunshine persists its TLS identity, paired
-client records, generated config, and app list under `/mnt/user_data`.
+enter the PIN shown by Moonlight. Sunshine persists its TLS identity and paired
+client records under `/mnt/user_data`; runtime config and the app list are
+regenerated as read-only container-owned files on each start.
 
 ## Defaults
 
@@ -71,7 +72,8 @@ client records, generated config, and app list under `/mnt/user_data`.
 - Sunshine HTTP/HTTPS ports: `47989` / `47984`
 - Sunshine RTSP/media/control ports: `48010`, `47998`, `48000`, `47999`
 - Sunshine capture: `SUNSHINE_CAPTURE`, default `kwin`; set `auto` to let Sunshine choose
-- Sunshine encoder: `SUNSHINE_ENCODER`, default auto
+- Sunshine encoder: `SUNSHINE_ENCODER`, default `vaapi`; set `auto` to let Sunshine choose
+- Sunshine gamepad: fixed to `xone` on Linux, the supported Xbox-style virtual pad
 
 Runtime package changes are intentionally blocked. Add or remove system packages
 in `build/container/Dockerfile`, then rebuild the image. Steam is seeded from

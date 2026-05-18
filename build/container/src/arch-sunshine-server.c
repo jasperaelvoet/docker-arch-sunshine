@@ -4,6 +4,9 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
+#include <openssl/sha.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -16,12 +19,13 @@
 #include <unistd.h>
 
 #define USER_DATA "/mnt/user_data"
-#define CONFIG_DIR USER_DATA "/etc/sunshine"
+#define CONFIG_DIR "/run/arch-sunshine/sunshine"
 #define STATE_DIR USER_DATA "/var/lib/sunshine"
 #define LOG_DIR USER_DATA "/var/log/arch-sunshine"
-#define PIN_FIFO STATE_DIR "/pin.fifo"
 #define CONFIG_FILE CONFIG_DIR "/sunshine.conf"
 #define APPS_FILE CONFIG_DIR "/apps.json"
+#define CREDENTIALS_FILE CONFIG_DIR "/credentials.json"
+#define API_PASSWORD_FILE CONFIG_DIR "/api-password"
 
 static const char *env_or_default(const char *name, const char *fallback) {
     const char *value = getenv(name);
@@ -55,21 +59,37 @@ static int mkdir_p(const char *path, mode_t mode) {
     return 0;
 }
 
-static int ensure_fifo(const char *path) {
-    struct stat st;
-
-    if (lstat(path, &st) == 0) {
-        if (S_ISFIFO(st.st_mode)) {
-            return 0;
-        }
-        if (unlink(path) != 0) {
-            return -1;
-        }
-    } else if (errno != ENOENT) {
+static int chown_path(const char *path, uid_t uid, gid_t gid) {
+    if (chown(path, uid, gid) != 0 && errno != ENOENT) {
         return -1;
     }
+    return 0;
+}
 
-    return mkfifo(path, 0600);
+static int chmod_path(const char *path, mode_t mode) {
+    if (chmod(path, mode) != 0 && errno != ENOENT) {
+        return -1;
+    }
+    return 0;
+}
+
+static int drop_to_desktop_user(void) {
+    const char *user = env_or_default("SUNSHINE_DESKTOP_USER", "sunshine");
+    struct passwd *pw = getpwnam(user);
+    if (!pw) {
+        errno = ENOENT;
+        return -1;
+    }
+    if (initgroups(user, pw->pw_gid) != 0) {
+        return -1;
+    }
+    if (setgid(pw->pw_gid) != 0) {
+        return -1;
+    }
+    if (setuid(pw->pw_uid) != 0) {
+        return -1;
+    }
+    return 0;
 }
 
 static bool is_render_node(const char *name) {
@@ -173,9 +193,10 @@ static void json_env_line(FILE *file, const char *key, const char *value, bool c
 static int write_config(void) {
     char *adapter = render_node();
     const char *capture = env_or_default("SUNSHINE_CAPTURE", "kwin");
-    const char *encoder = env_or_default("SUNSHINE_ENCODER", "");
+    const char *encoder = env_or_default("SUNSHINE_ENCODER", "vaapi");
     const char *display = env_or_default("SUNSHINE_DISPLAY", "");
     bool write_capture = *capture && strcasecmp(capture, "auto") != 0;
+    bool write_encoder = *encoder && strcasecmp(encoder, "auto") != 0;
 
     FILE *file = fopen(CONFIG_FILE, "w");
     if (!file) {
@@ -189,13 +210,13 @@ static int write_config(void) {
         "min_log_level = info\n"
         "log_path = " LOG_DIR "/sunshine.log\n"
         "file_state = " STATE_DIR "/sunshine_state.json\n"
-        "credentials_file = " STATE_DIR "/sunshine_state.json\n"
+        "credentials_file = " CREDENTIALS_FILE "\n"
         "pkey = " STATE_DIR "/sunshine.key\n"
         "cert = " STATE_DIR "/sunshine.crt\n"
         "file_apps = " APPS_FILE "\n"
         "address_family = ipv4\n"
         "upnp = disabled\n"
-        "origin_web_ui_allowed = wan\n"
+        "origin_web_ui_allowed = pc\n"
         "lan_encryption_mode = 0\n"
         "wan_encryption_mode = 0\n"
         "system_tray = disabled\n"
@@ -203,12 +224,14 @@ static int write_config(void) {
         "stream_audio = enabled\n"
         "audio_sink = arch_sunshine_audio.monitor\n"
         "virtual_sink = arch_sunshine_audio\n"
-        "gamepad = x360\n");
+        "gamepad = xone\n"
+        "motion_as_ds4 = disabled\n"
+        "touchpad_as_ds4 = disabled\n");
 
     if (write_capture) {
         fprintf(file, "capture = %s\n", capture);
     }
-    if (*encoder) {
+    if (write_encoder) {
         fprintf(file, "encoder = %s\n", encoder);
     }
     if (*display) {
@@ -269,6 +292,10 @@ static int write_runtime_files(void) {
         perror("arch-sunshine-server: mkdir");
         return 1;
     }
+    if (chmod_path(CONFIG_DIR, 0755) != 0) {
+        perror("arch-sunshine-server: unlock config directory");
+        return 1;
+    }
     if (write_config() != 0) {
         perror("arch-sunshine-server: write sunshine.conf");
         return 1;
@@ -277,8 +304,13 @@ static int write_runtime_files(void) {
         perror("arch-sunshine-server: write apps.json");
         return 1;
     }
-    if (ensure_fifo(PIN_FIFO) != 0) {
-        perror("arch-sunshine-server: create pin fifo");
+    if (chown_path(CONFIG_DIR, 0, 0) != 0 ||
+        chown_path(CONFIG_FILE, 0, 0) != 0 ||
+        chown_path(APPS_FILE, 0, 0) != 0 ||
+        chmod_path(CONFIG_FILE, 0444) != 0 ||
+        chmod_path(APPS_FILE, 0444) != 0 ||
+        chmod_path(CONFIG_DIR, 0555) != 0) {
+        perror("arch-sunshine-server: lock config files");
         return 1;
     }
     return 0;
@@ -300,104 +332,119 @@ static int wait_child(pid_t pid) {
     return 1;
 }
 
-static void seed_web_credentials(void) {
-    pid_t pid = fork();
-    if (pid == 0) {
-        int null_fd = open("/dev/null", O_RDWR);
-        if (null_fd >= 0) {
-            dup2(null_fd, STDOUT_FILENO);
-            dup2(null_fd, STDERR_FILENO);
-            close(null_fd);
-        }
-        execl(
-            "/usr/local/bin/sunshine",
-            "sunshine",
-            CONFIG_FILE,
-            "--creds",
-            env_or_default("SUNSHINE_WEB_UI_USER", "sunshine"),
-            env_or_default("SUNSHINE_WEB_UI_PASS", "sunshine"),
-            (char *)NULL);
-        _exit(127);
+static int random_hex(char *target, size_t target_size) {
+    if (target_size < 3 || target_size % 2 == 0) {
+        errno = EINVAL;
+        return -1;
     }
-    if (pid > 0) {
-        (void)wait_child(pid);
+    size_t byte_count = (target_size - 1) / 2;
+    unsigned char bytes[64];
+    if (byte_count > sizeof(bytes)) {
+        errno = EINVAL;
+        return -1;
     }
+    int random_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (random_fd < 0) {
+        return -1;
+    }
+    ssize_t read_bytes = read(random_fd, bytes, byte_count);
+    close(random_fd);
+    if (read_bytes != (ssize_t)byte_count) {
+        return -1;
+    }
+    for (size_t i = 0; i < byte_count; i++) {
+        snprintf(target + (i * 2), 3, "%02X", bytes[i]);
+    }
+    target[target_size - 1] = '\0';
+    return 0;
 }
 
-static void fifo_pump(int write_fd) {
-    for (;;) {
-        int read_fd = open(PIN_FIFO, O_RDONLY);
-        if (read_fd < 0) {
-            usleep(100000);
-            continue;
-        }
-
-        char buffer[256];
-        ssize_t bytes;
-        while ((bytes = read(read_fd, buffer, sizeof(buffer))) > 0) {
-            char *cursor = buffer;
-            ssize_t remaining = bytes;
-            while (remaining > 0) {
-                ssize_t written = write(write_fd, cursor, (size_t)remaining);
-                if (written < 0) {
-                    close(read_fd);
-                    _exit(errno == EPIPE ? 0 : 1);
-                }
-                cursor += written;
-                remaining -= written;
-            }
-        }
-        close(read_fd);
+static void sha256_hex(const char *value, char *target) {
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256((const unsigned char *)value, strlen(value), digest);
+    for (size_t i = 0; i < sizeof(digest); i++) {
+        snprintf(target + (i * 2), 3, "%02X", digest[sizeof(digest) - i - 1]);
     }
+    target[SHA256_DIGEST_LENGTH * 2] = '\0';
+}
+
+static int seed_web_credentials(void) {
+    char salt[33];
+    char password[65];
+    char password_hash[65];
+    if (random_hex(salt, sizeof(salt)) != 0 || random_hex(password, sizeof(password)) != 0) {
+        return -1;
+    }
+    char password_salt[sizeof(password) + sizeof(salt)];
+    snprintf(password_salt, sizeof(password_salt), "%s%s", password, salt);
+    sha256_hex(password_salt, password_hash);
+
+    (void)chmod_path(CONFIG_DIR, 0755);
+    (void)unlink(CREDENTIALS_FILE);
+    (void)unlink(API_PASSWORD_FILE);
+
+    FILE *file = fopen(CREDENTIALS_FILE, "w");
+    if (!file) {
+        (void)chmod_path(CONFIG_DIR, 0555);
+        return -1;
+    }
+    fprintf(
+        file,
+        "{\n"
+        "    \"username\": \"arch-sunshine-locked\",\n"
+        "    \"salt\": \"%s\",\n"
+        "    \"password\": \"%s\"\n"
+        "}\n",
+        salt,
+        password_hash);
+    int failed = ferror(file);
+    failed |= fclose(file) != 0;
+
+    FILE *password_file = fopen(API_PASSWORD_FILE, "w");
+    if (!password_file) {
+        failed = 1;
+    } else {
+        fprintf(password_file, "%s\n", password);
+        failed |= ferror(password_file);
+        failed |= fclose(password_file) != 0;
+    }
+
+    (void)chown_path(CREDENTIALS_FILE, 0, 0);
+    (void)chown_path(API_PASSWORD_FILE, 0, 0);
+    (void)chmod_path(CREDENTIALS_FILE, 0444);
+    (void)chmod_path(API_PASSWORD_FILE, 0400);
+    (void)chmod_path(CONFIG_DIR, 0555);
+    if (failed || access(CREDENTIALS_FILE, R_OK) != 0 || access(API_PASSWORD_FILE, R_OK) != 0) {
+        return -1;
+    }
+    return 0;
 }
 
 static int command_serve(void) {
     if (write_runtime_files() != 0) {
         return 1;
     }
-    seed_web_credentials();
-
-    int pipe_fds[2];
-    if (pipe(pipe_fds) != 0) {
-        perror("arch-sunshine-server: pipe");
-        return 1;
-    }
-
-    pid_t pump_pid = fork();
-    if (pump_pid == 0) {
-        close(pipe_fds[0]);
-        fifo_pump(pipe_fds[1]);
-        _exit(0);
-    }
-    if (pump_pid < 0) {
-        perror("arch-sunshine-server: fork");
-        close(pipe_fds[0]);
-        close(pipe_fds[1]);
+    if (seed_web_credentials() != 0) {
+        perror("arch-sunshine-server: seed locked web credentials");
         return 1;
     }
 
     pid_t sunshine_pid = fork();
     if (sunshine_pid == 0) {
-        close(pipe_fds[1]);
-        dup2(pipe_fds[0], STDIN_FILENO);
-        close(pipe_fds[0]);
-        execl("/usr/local/bin/sunshine", "sunshine", "-0", CONFIG_FILE, (char *)NULL);
+        if (drop_to_desktop_user() != 0) {
+            perror("arch-sunshine-server: drop privileges");
+            _exit(127);
+        }
+        execl("/usr/local/bin/sunshine", "sunshine", CONFIG_FILE, (char *)NULL);
         _exit(127);
     }
-    close(pipe_fds[0]);
-    close(pipe_fds[1]);
 
     if (sunshine_pid < 0) {
         perror("arch-sunshine-server: fork");
-        kill(pump_pid, SIGTERM);
-        (void)wait_child(pump_pid);
         return 1;
     }
 
-    int status = wait_child(sunshine_pid);
-    kill(pump_pid, SIGTERM);
-    (void)wait_child(pump_pid);
-    return status;
+    return wait_child(sunshine_pid);
 }
 
 static int command_pin(const char *pin) {
@@ -412,32 +459,51 @@ static int command_pin(const char *pin) {
         }
     }
 
-    struct timespec start;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-    int fd = -1;
-    for (;;) {
-        fd = open(PIN_FIFO, O_WRONLY | O_NONBLOCK);
-        if (fd >= 0) {
-            break;
-        }
-        if (errno != ENOENT && errno != ENXIO) {
-            perror("arch-sunshine-server: open pin fifo");
-            return 1;
-        }
+    const char *script =
+        "import base64, json, ssl, sys, time, urllib.error, urllib.request\n"
+        "pin = sys.argv[1]\n"
+        "password_path = '" API_PASSWORD_FILE "'\n"
+        "url = 'https://127.0.0.1:47990/api/pin'\n"
+        "deadline = time.monotonic() + 30\n"
+        "with open(password_path, 'r', encoding='utf-8') as f:\n"
+        "    password = f.read().strip()\n"
+        "auth = base64.b64encode(('arch-sunshine-locked:' + password).encode()).decode()\n"
+        "payload = json.dumps({'pin': pin, 'name': 'Moonlight'}).encode()\n"
+        "context = ssl._create_unverified_context()\n"
+        "last_error = None\n"
+        "while time.monotonic() < deadline:\n"
+        "    request = urllib.request.Request(url, data=payload, method='POST', headers={\n"
+        "        'Authorization': 'Basic ' + auth,\n"
+        "        'Content-Type': 'application/json',\n"
+        "    })\n"
+        "    try:\n"
+        "        with urllib.request.urlopen(request, timeout=5, context=context) as response:\n"
+        "            body = response.read().decode()\n"
+        "        print(body)\n"
+        "        data = json.loads(body)\n"
+        "        if data.get('status') is True:\n"
+        "            sys.exit(0)\n"
+        "        last_error = body\n"
+        "    except Exception as exc:\n"
+        "        last_error = str(exc)\n"
+        "    time.sleep(0.25)\n"
+        "print('failed to send PIN to Sunshine API: ' + str(last_error), file=sys.stderr)\n"
+        "sys.exit(1)\n";
 
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        if ((now.tv_sec - start.tv_sec) >= 30) {
-            fprintf(stderr, "Sunshine PIN FIFO is not ready: %s\n", PIN_FIFO);
-            return 1;
-        }
-        usleep(100000);
+    pid_t pid = fork();
+    if (pid == 0) {
+        execlp("python3", "python3", "-c", script, pin, (char *)NULL);
+        _exit(127);
     }
-
-    dprintf(fd, "%s\n", pin);
-    close(fd);
-    puts("PIN sent to Sunshine.");
-    return 0;
+    if (pid < 0) {
+        perror("arch-sunshine-server: fork");
+        return 1;
+    }
+    int status = wait_child(pid);
+    if (status == 0) {
+        puts("PIN sent to Sunshine.");
+    }
+    return status;
 }
 
 int main(int argc, char **argv) {

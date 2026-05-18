@@ -13,12 +13,13 @@ RUN printf '\nDisableSandbox\n' >> /etc/pacman.conf \
       gcc \
       glib2 \
       libei \
+      openssl \
       pkgconf
 
 COPY build/container/src/ /usr/local/src/arch-sunshine/
 RUN mkdir -p /out \
     && cc -O2 -pipe -Wall -Wextra -o /out/arch-sunshine-input-bridge /usr/local/src/arch-sunshine/arch-sunshine-input-bridge.c $(pkg-config --cflags --libs gio-2.0 gio-unix-2.0 libei-1.0) \
-    && cc -O2 -pipe -Wall -Wextra -o /out/arch-sunshine-server /usr/local/src/arch-sunshine/arch-sunshine-server.c \
+    && cc -O2 -pipe -Wall -Wextra -o /out/arch-sunshine-server /usr/local/src/arch-sunshine/arch-sunshine-server.c -lcrypto \
     && strip /out/arch-sunshine-input-bridge /out/arch-sunshine-server
 
 FROM --platform=linux/amd64 archlinux:base
@@ -191,6 +192,13 @@ RUN install -d -m 1777 /var/lib/xkb \
     && ln -sf /usr/local/bin/arch-sunshine-pacman /usr/bin/pacman \
     && ln -sf /usr/local/bin/arch-sunshine-steam /usr/local/bin/steam \
     && ln -sf /usr/local/bin/arch-sunshine-steamos-update /usr/bin/steamos-update \
+    && rm -f \
+      /usr/share/applications/dev.lizardbyte.app.Sunshine.desktop \
+      /usr/share/applications/dev.lizardbyte.app.Sunshine.terminal.desktop \
+    && if [ -f /usr/share/applications/dev.lizardbyte.app.Sunshine.kwin.desktop ]; then \
+      sed -i '/^Hidden=/d;/^NoDisplay=/d' /usr/share/applications/dev.lizardbyte.app.Sunshine.kwin.desktop; \
+      printf '\nNoDisplay=true\n' >> /usr/share/applications/dev.lizardbyte.app.Sunshine.kwin.desktop; \
+    fi \
     && if [ -f /usr/share/applications/steam.desktop ]; then \
       sed -i 's@Exec=/usr/bin/steam@Exec=/usr/local/bin/arch-sunshine-steam@g' /usr/share/applications/steam.desktop; \
     fi
