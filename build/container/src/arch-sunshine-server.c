@@ -26,6 +26,8 @@
 #define APPS_FILE CONFIG_DIR "/apps.json"
 #define CREDENTIALS_FILE CONFIG_DIR "/credentials.json"
 #define API_PASSWORD_FILE CONFIG_DIR "/api-password"
+#define LIBEI_INPUT_PRELOAD "/usr/local/lib/arch-sunshine-libei-input.so"
+#define DYNAMIC_LINKER "/lib64/ld-linux-x86-64.so.2"
 
 static const char *env_or_default(const char *name, const char *fallback) {
     const char *value = getenv(name);
@@ -222,7 +224,7 @@ static int write_config(void) {
         "system_tray = disabled\n"
         "global_prep_cmd = [{\"do\":\"/usr/local/bin/arch-sunshine client-start\",\"undo\":\"/usr/local/bin/arch-sunshine client-stop\"}]\n"
         "stream_audio = enabled\n"
-        "audio_sink = arch_sunshine_audio.monitor\n"
+        "audio_sink = arch_sunshine_audio\n"
         "virtual_sink = arch_sunshine_audio\n"
         "gamepad = xone\n"
         "motion_as_ds4 = disabled\n"
@@ -435,7 +437,16 @@ static int command_serve(void) {
             perror("arch-sunshine-server: drop privileges");
             _exit(127);
         }
-        execl("/usr/local/bin/sunshine", "sunshine", CONFIG_FILE, (char *)NULL);
+        setenv("ARCH_SUNSHINE_LIBEI_INPUT", "1", 1);
+        execl(
+            DYNAMIC_LINKER,
+            "ld-linux-x86-64.so.2",
+            "--preload",
+            LIBEI_INPUT_PRELOAD,
+            "/usr/local/bin/sunshine",
+            CONFIG_FILE,
+            (char *)NULL);
+        perror("arch-sunshine-server: exec sunshine with libei input preload");
         _exit(127);
     }
 

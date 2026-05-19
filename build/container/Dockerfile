@@ -13,14 +13,16 @@ RUN printf '\nDisableSandbox\n' >> /etc/pacman.conf \
       gcc \
       glib2 \
       libei \
+      libevdev \
       openssl \
       pkgconf
 
 COPY build/container/src/ /usr/local/src/arch-sunshine/
 RUN mkdir -p /out \
-    && cc -O2 -pipe -Wall -Wextra -o /out/arch-sunshine-input-bridge /usr/local/src/arch-sunshine/arch-sunshine-input-bridge.c $(pkg-config --cflags --libs gio-2.0 gio-unix-2.0 libei-1.0) \
+    && cc -O2 -pipe -Wall -Wextra -fPIC -shared -o /out/arch-sunshine-libei-input.so /usr/local/src/arch-sunshine/arch-sunshine-libei-input.c $(pkg-config --cflags --libs gio-2.0 gio-unix-2.0 libei-1.0 libevdev) -ldl -pthread \
+    && cc -O2 -pipe -Wall -Wextra -o /out/arch-sunshine-libei-input-test /usr/local/src/arch-sunshine/arch-sunshine-libei-input-test.c $(pkg-config --cflags --libs libevdev) \
     && cc -O2 -pipe -Wall -Wextra -o /out/arch-sunshine-server /usr/local/src/arch-sunshine/arch-sunshine-server.c -lcrypto \
-    && strip /out/arch-sunshine-input-bridge /out/arch-sunshine-server
+    && strip /out/arch-sunshine-libei-input.so /out/arch-sunshine-libei-input-test /out/arch-sunshine-server
 
 FROM --platform=linux/amd64 archlinux:base
 
@@ -168,7 +170,8 @@ RUN /usr/local/bin/arch-sunshine-preseed-steam
 
 COPY config/sunshine/ /usr/share/arch-sunshine/
 COPY --chmod=755 build/container/bin/arch-sunshine /usr/local/bin/arch-sunshine
-COPY --from=native-builder /out/arch-sunshine-input-bridge /usr/local/bin/arch-sunshine-input-bridge
+COPY --from=native-builder /out/arch-sunshine-libei-input.so /usr/local/lib/arch-sunshine-libei-input.so
+COPY --from=native-builder /out/arch-sunshine-libei-input-test /usr/local/bin/arch-sunshine-libei-input-test
 COPY --from=native-builder /out/arch-sunshine-server /usr/local/bin/arch-sunshine-server
 COPY --chmod=755 build/container/bin/arch-sunshine-network-status /usr/local/bin/arch-sunshine-network-status
 COPY --chmod=755 build/container/bin/arch-sunshine-pacman /usr/local/bin/arch-sunshine-pacman

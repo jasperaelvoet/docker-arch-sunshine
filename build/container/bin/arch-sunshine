@@ -9,7 +9,6 @@ import shutil
 import signal
 import socket
 import stat
-import struct
 import subprocess
 import sys
 import threading
@@ -40,6 +39,13 @@ DEFAULT_WIDTH = "1920"
 DEFAULT_HEIGHT = "1080"
 DEFAULT_FPS = "60"
 DEFAULT_SCALE = "auto"
+AUDIO_SINK_NAME = "arch_sunshine_audio"
+AUDIO_SINK_DESCRIPTION = "Arch_Stream_Audio"
+AUDIO_CHANNEL_MAPS = {
+    2: "front-left,front-right",
+    6: "front-left,front-right,front-center,lfe,rear-left,rear-right",
+    8: "front-left,front-right,front-center,lfe,rear-left,rear-right,side-left,side-right",
+}
 ELEMENT_CACHE = {}
 
 
@@ -85,6 +91,38 @@ def sanitize_refresh_rate(value, fallback):
     if parsed.is_integer():
         return str(int(parsed))
     return f"{parsed:g}"
+
+
+def sanitize_audio_channels(value, fallback=2):
+    try:
+        channels = int(str(value), 10)
+    except (TypeError, ValueError):
+        return fallback
+    if channels in AUDIO_CHANNEL_MAPS:
+        return channels
+    return fallback
+
+
+def audio_channels_from_configuration(value, fallback=2):
+    text = str(value or "").strip()
+    if text == "2.0":
+        return 2
+    if text == "5.1":
+        return 6
+    if text == "7.1":
+        return 8
+    return sanitize_audio_channels(text, fallback)
+
+
+def requested_audio_channels():
+    return audio_channels_from_configuration(
+        os.environ.get("SUNSHINE_CLIENT_AUDIO_CONFIGURATION"),
+        sanitize_audio_channels(os.environ.get("SUNSHINE_AUDIO_CHANNELS", "2"), 2),
+    )
+
+
+def default_audio_channels():
+    return sanitize_audio_channels(os.environ.get("SUNSHINE_AUDIO_CHANNELS", "2"), 2)
 
 
 def sanitize_scale_request(value, fallback=DEFAULT_SCALE):
@@ -958,138 +996,28 @@ def wait_for_dbus_name(name, env, process, timeout):
     return False
 
 
-class UInputTestDevice:
-    UI_SET_EVBIT = 0x40045564
-    UI_SET_KEYBIT = 0x40045565
-    UI_SET_RELBIT = 0x40045566
-    UI_DEV_CREATE = 0x5501
-    UI_DEV_DESTROY = 0x5502
+def libei_input_test_env(env):
+    helper_env = dict(env)
+    helper_env["ARCH_SUNSHINE_LIBEI_INPUT"] = "1"
+    preload = "/usr/local/lib/arch-sunshine-libei-input.so"
+    existing = helper_env.get("LD_PRELOAD", "")
+    helper_env["LD_PRELOAD"] = preload if not existing else f"{preload}:{existing}"
+    return helper_env
 
-    EV_SYN = 0
-    EV_KEY = 1
-    EV_REL = 2
-    SYN_REPORT = 0
-    REL_X = 0
-    REL_Y = 1
-    KEY_A = 30
-    KEY_B = 48
-    KEY_C = 46
-    KEY_ENTER = 28
-    KEY_T = 20
-    BTN_LEFT = 272
-    BTN_RIGHT = 273
-    BTN_MIDDLE = 274
 
-    def __init__(self):
-        self.fd = None
-
-    def __enter__(self):
-        import fcntl
-
-        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
-        for ev_type in (self.EV_KEY, self.EV_REL):
-            fcntl.ioctl(self.fd, self.UI_SET_EVBIT, ev_type)
-        for key_code in (
-            self.KEY_A,
-            self.KEY_B,
-            self.KEY_C,
-            self.KEY_ENTER,
-            self.KEY_T,
-            self.BTN_LEFT,
-            self.BTN_RIGHT,
-            self.BTN_MIDDLE,
-        ):
-            fcntl.ioctl(self.fd, self.UI_SET_KEYBIT, key_code)
-        for rel_code in (self.REL_X, self.REL_Y):
-            fcntl.ioctl(self.fd, self.UI_SET_RELBIT, rel_code)
-
-        user_dev = struct.pack(
-            "80sHHHHI" + "i" * 256,
-            b"Arch Sunshine Input Test\0",
-            0x03,
-            0xCAFE,
-            0x0001,
-            1,
-            0,
-            *([0] * 256),
+def run_libei_input_test(env, target):
+    helper = Path("/usr/local/bin/arch-sunshine-libei-input-test")
+    if not helper.exists():
+        raise StreamError(f"libei input test helper not found: {helper}")
+    with (LOG_DIR / "libei-input-test.log").open("ab") as log_handle:
+        result = run_as_desktop_user(
+            [str(helper), target],
+            libei_input_test_env(env),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
         )
-        os.write(self.fd, user_dev)
-        fcntl.ioctl(self.fd, self.UI_DEV_CREATE)
-        return self
-
-    def __exit__(self, _exc_type, _exc, _tb):
-        if self.fd is None:
-            return
-        import fcntl
-
-        try:
-            fcntl.ioctl(self.fd, self.UI_DEV_DESTROY)
-        except OSError:
-            pass
-        os.close(self.fd)
-        self.fd = None
-
-    def emit(self, event_type, code, value):
-        now = time.time()
-        seconds = int(now)
-        useconds = int((now - seconds) * 1_000_000)
-        os.write(self.fd, struct.pack("llHHi", seconds, useconds, event_type, code, value))
-
-    def sync(self):
-        self.emit(self.EV_SYN, self.SYN_REPORT, 0)
-
-    def move(self, dx, dy):
-        self.emit(self.EV_REL, self.REL_X, dx)
-        self.emit(self.EV_REL, self.REL_Y, dy)
-        self.sync()
-
-    def click_button(self, button):
-        self.emit(self.EV_KEY, button, 1)
-        self.sync()
-        time.sleep(0.05)
-        self.emit(self.EV_KEY, button, 0)
-        self.sync()
-
-    def click_left(self):
-        self.click_button(self.BTN_LEFT)
-
-    def click_middle(self):
-        self.click_button(self.BTN_MIDDLE)
-
-    def duplicate_middle_hold(self):
-        self.emit(self.EV_KEY, self.BTN_MIDDLE, 1)
-        self.sync()
-        time.sleep(0.05)
-        self.emit(self.EV_KEY, self.BTN_MIDDLE, 1)
-        self.sync()
-        time.sleep(0.05)
-        self.emit(self.EV_KEY, self.BTN_MIDDLE, 0)
-        self.sync()
-        time.sleep(0.05)
-        self.emit(self.EV_KEY, self.BTN_MIDDLE, 0)
-        self.sync()
-
-    def click_right(self):
-        self.click_button(self.BTN_RIGHT)
-
-    def type_t(self):
-        self.emit(self.EV_KEY, self.KEY_T, 1)
-        self.sync()
-        time.sleep(0.05)
-        self.emit(self.EV_KEY, self.KEY_T, 0)
-        self.sync()
-
-    def tap_key(self, key_code):
-        self.emit(self.EV_KEY, key_code, 1)
-        self.sync()
-        time.sleep(0.03)
-        self.emit(self.EV_KEY, key_code, 0)
-        self.sync()
-
-    def type_abc_enter(self):
-        for key_code in (self.KEY_A, self.KEY_B, self.KEY_C, self.KEY_ENTER):
-            self.tap_key(key_code)
-            time.sleep(0.03)
+    if result.returncode != 0:
+        raise StreamError(f"libei input test helper failed for {target}")
 
 
 def read_process_lines(process, timeout, echo=False):
@@ -1193,7 +1121,7 @@ def start_pipewire_stack(runtime_dir, env):
         terminate_process(pipewire)
         raise StreamError("timed out waiting for PipeWire Pulse")
 
-    ensure_audio_sink(env)
+    ensure_audio_sink(env, default_audio_channels())
     return [pipewire, wireplumber, pulse]
 
 
@@ -1203,48 +1131,172 @@ def start_portal_stack(env):
     return [backend, portal]
 
 
-def ensure_audio_sink(env):
-    found_sink = False
+def audio_sink_details(env):
     result = run_as_desktop_user(
-        ["pactl", "list", "short", "sinks"],
+        ["pactl", "list", "sinks"],
         env,
         capture_output=True,
         text=True,
     )
-    if result.returncode == 0:
-        names = [line.split()[1] for line in result.stdout.splitlines() if len(line.split()) > 1]
-        if "arch_sunshine_audio" in names:
-            found_sink = True
+    if result.returncode != 0:
+        return {}
 
-    if not found_sink:
+    current = {}
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if raw_line.startswith("Sink #"):
+            if current.get("name") == AUDIO_SINK_NAME:
+                return current
+            current = {}
+            continue
+        if line.startswith("Name:"):
+            current["name"] = line.partition(":")[2].strip()
+        elif current.get("name") == AUDIO_SINK_NAME and line.startswith("Owner Module:"):
+            owner = line.partition(":")[2].strip()
+            if owner.isdigit():
+                current["owner_module"] = owner
+        elif current.get("name") == AUDIO_SINK_NAME and line.startswith("Sample Specification:"):
+            for part in line.split():
+                if part.endswith("ch") and part[:-2].isdigit():
+                    current["channels"] = int(part[:-2])
+                    break
+
+    if current.get("name") == AUDIO_SINK_NAME:
+        return current
+    return {}
+
+
+def pipewire_node_id(env, node_name, media_class):
+    if not command_available("pw-dump"):
+        return None
+    result = run_as_desktop_user(
+        ["pw-dump", "Node"],
+        env,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        nodes = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+    for node in nodes:
+        props = node.get("info", {}).get("props", {})
+        if props.get("node.name") != node_name:
+            continue
+        if props.get("media.class") != media_class:
+            continue
+        node_id = props.get("object.id", node.get("id"))
+        return str(node_id)
+    return None
+
+
+def set_audio_defaults(env):
+    run_as_desktop_user(
+        ["pactl", "set-default-sink", AUDIO_SINK_NAME],
+        env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    run_as_desktop_user(
+        ["pactl", "set-default-source", f"{AUDIO_SINK_NAME}.monitor"],
+        env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    if command_available("wpctl"):
+        node_id = pipewire_node_id(env, AUDIO_SINK_NAME, "Audio/Sink")
+        if node_id:
+            run_as_desktop_user(
+                ["wpctl", "set-default", node_id],
+                env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    move_audio_streams_to_sink(env)
+
+
+def set_audio_volume(env, channels):
+    volumes = ["100%"] * channels
+    run_as_desktop_user(
+        ["pactl", "set-sink-volume", AUDIO_SINK_NAME, *volumes],
+        env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    run_as_desktop_user(
+        ["pactl", "set-source-volume", f"{AUDIO_SINK_NAME}.monitor", *volumes],
+        env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def move_audio_streams_to_sink(env):
+    result = run_as_desktop_user(
+        ["pactl", "list", "short", "sink-inputs"],
+        env,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return
+
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        run_as_desktop_user(
+            ["pactl", "move-sink-input", parts[0], AUDIO_SINK_NAME],
+            env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+def ensure_audio_sink(env, channels=None):
+    channels = sanitize_audio_channels(channels if channels is not None else default_audio_channels())
+    details = audio_sink_details(env)
+    if details and details.get("channels") != channels:
+        owner_module = details.get("owner_module")
+        if not owner_module:
+            raise StreamError(f"cannot recreate {AUDIO_SINK_NAME}: owner module is unknown")
+        with (LOG_DIR / "audio-sink.log").open("ab") as log_handle:
+            result = run_as_desktop_user(
+                ["pactl", "unload-module", owner_module],
+                env,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+            )
+        if result.returncode != 0:
+            raise StreamError(f"failed to recreate {AUDIO_SINK_NAME} with {channels} channels")
+        details = {}
+
+    if not details:
         with (LOG_DIR / "audio-sink.log").open("ab") as log_handle:
             result = run_as_desktop_user(
                 [
                     "pactl",
                     "load-module",
                     "module-null-sink",
-                    "sink_name=arch_sunshine_audio",
-                    "sink_properties=device.description=Arch_Stream_Audio",
+                    f"sink_name={AUDIO_SINK_NAME}",
+                    "rate=48000",
+                    f"channels={channels}",
+                    f"channel_map={AUDIO_CHANNEL_MAPS[channels]}",
+                    f"sink_properties=device.description={AUDIO_SINK_DESCRIPTION}",
                 ],
                 env,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
             )
         if result.returncode != 0:
-            raise StreamError("failed to create arch_sunshine_audio PipeWire sink")
+            raise StreamError(f"failed to create {AUDIO_SINK_NAME} PipeWire sink")
 
-    run_as_desktop_user(
-        ["pactl", "set-default-sink", "arch_sunshine_audio"],
-        env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    run_as_desktop_user(
-        ["pactl", "set-default-source", "arch_sunshine_audio.monitor"],
-        env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    set_audio_volume(env, channels)
+    set_audio_defaults(env)
 
 
 def process_status(process):
@@ -1273,20 +1325,13 @@ def chosen_encoder_summary():
 
 
 def audio_status(env):
-    result = run_as_desktop_user(
-        ["pactl", "list", "short", "sinks"],
-        env,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return "unavailable"
-
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) > 1 and parts[1] == "arch_sunshine_audio":
-            return "arch_sunshine_audio"
-    return "missing arch_sunshine_audio"
+    details = audio_sink_details(env)
+    if not details:
+        return f"missing {AUDIO_SINK_NAME}"
+    channels = details.get("channels")
+    if channels:
+        return f"{AUDIO_SINK_NAME} {channels}ch"
+    return AUDIO_SINK_NAME
 
 
 def render_nodes_summary():
@@ -1354,7 +1399,7 @@ def draw_desktop_ui(_args, runtime_dir, socket_path, desktop_env, state):
     print()
     print("Status")
     print(f"  Desktop    kwin {process_status(state.get('kwin'))} / plasmashell {process_status(state.get('plasmashell'))}")
-    print(f"  Moonlight  Sunshine {process_status(state.get('sunshine'))} / input {process_status(state.get('input_bridge'))}")
+    print(f"  Moonlight  Sunshine {process_status(state.get('sunshine'))} / input libei preload")
     print(f"  Wayland    {path_status(socket_path)}  {socket_path}")
     print(f"  PipeWire   {path_status(runtime_dir / 'pipewire-0')}")
     print(f"  Pulse      {path_status(runtime_dir / 'pulse' / 'native')}  sink {audio_status(desktop_env)}")
@@ -1371,7 +1416,7 @@ def draw_desktop_ui(_args, runtime_dir, socket_path, desktop_env, state):
     print(f"  KWin       {LOG_DIR / 'kwin-wayland.log'}")
     print(f"  Plasma     {LOG_DIR / 'plasmashell.log'}")
     print(f"  Sunshine   {LOG_DIR / 'sunshine.log'}")
-    print(f"  Input      {LOG_DIR / 'input-bridge.log'}")
+    print(f"  Input      {LOG_DIR / 'sunshine-wrapper.log'}")
     print(f"  PipeWire   {LOG_DIR / 'pipewire.log'}")
     print(f"  Pulse      {LOG_DIR / 'pipewire-pulse.log'}")
     print()
@@ -1392,7 +1437,6 @@ def check_session_processes(state):
     kwin = state.get("kwin")
     plasmashell = state.get("plasmashell")
     sunshine = state.get("sunshine")
-    input_bridge = state.get("input_bridge")
     session_actions = state.get("session_actions")
     if kwin is not None and kwin.poll() is not None:
         raise StreamError(f"kwin_wayland exited with status {kwin.returncode}")
@@ -1400,8 +1444,6 @@ def check_session_processes(state):
         raise StreamError(f"plasmashell exited with status {plasmashell.returncode}")
     if sunshine is not None and sunshine.poll() is not None:
         raise StreamError(f"Sunshine exited with status {sunshine.returncode}")
-    if input_bridge is not None and input_bridge.poll() is not None:
-        raise StreamError(f"input bridge exited with status {input_bridge.returncode}")
     if session_actions is not None and session_actions.poll() is not None:
         raise StreamError(f"session action service exited with status {session_actions.returncode}")
 
@@ -1433,7 +1475,7 @@ def remember_process(state, key, process):
 
 
 def stop_desktop_stack(state):
-    for key in ("input_bridge", "portal", "plasmashell", "activities", "kded", "kwin"):
+    for key in ("portal", "plasmashell", "activities", "kded", "kwin"):
         value = state.get(key)
         if isinstance(value, list):
             for process in reversed(value):
@@ -1489,22 +1531,11 @@ def start_desktop_stack(args, runtime_dir, socket_path, compositor_env, desktop_
     if not wait_for_process_name("plasmashell", plasmashell, args.ready_timeout):
         raise StreamError("timed out waiting for plasmashell")
     ensure_plasma_launcher_defaults(desktop_env)
+    set_audio_defaults(desktop_env)
 
     portals = start_portal_stack(desktop_env)
     state["processes"].extend(portals)
     state["portal"] = portals
-
-
-def start_input_bridge_if_needed(args, desktop_env, state):
-    if args.no_input_bridge or state.get("sunshine") is None:
-        return
-    input_bridge = start_as_desktop_user(
-        ["/usr/local/bin/arch-sunshine-input-bridge"],
-        desktop_env,
-        "input-bridge.log",
-    )
-    remember_process(state, "input_bridge", input_bridge)
-
 
 def restart_desktop_geometry(args, runtime_dir, socket_path, compositor_env, desktop_env, state, width, height, fps, scale, reason):
     if (
@@ -1524,13 +1555,17 @@ def restart_desktop_geometry(args, runtime_dir, socket_path, compositor_env, des
     stop_desktop_stack(state)
     state.update({"width": width, "height": height, "fps": fps, "scale": scale})
     start_desktop_stack(args, runtime_dir, socket_path, compositor_env, desktop_env, state)
-    start_input_bridge_if_needed(args, desktop_env, state)
 
 
 def handle_control_messages(args, runtime_dir, socket_path, compositor_env, desktop_env, state, control):
     for message in control.read_messages():
         command = message.get("command")
         if command == "client-start":
+            audio_channels = sanitize_audio_channels(message.get("audio_channels"), default_audio_channels())
+            if state.get("audio_channels") != audio_channels:
+                eprint(f"arch-sunshine: Moonlight client requested {audio_channels}-channel audio")
+            ensure_audio_sink(desktop_env, audio_channels)
+            state["audio_channels"] = audio_channels
             restart_desktop_geometry(
                 args,
                 runtime_dir,
@@ -1552,6 +1587,9 @@ def handle_control_messages(args, runtime_dir, socket_path, compositor_env, desk
                 except OSError:
                     pass
         elif command == "client-stop":
+            audio_channels = default_audio_channels()
+            ensure_audio_sink(desktop_env, audio_channels)
+            state["audio_channels"] = audio_channels
             width, height, fps, scale = default_geometry()
             restart_desktop_geometry(
                 args,
@@ -1607,7 +1645,6 @@ def run_desktop_ui_loop(args, runtime_dir, socket_path, desktop_env, compositor_
                     (
                         LOG_DIR / "sunshine.log",
                         LOG_DIR / "sunshine-wrapper.log",
-                        LOG_DIR / "input-bridge.log",
                         LOG_DIR / "kwin-wayland.log",
                         LOG_DIR / "plasmashell.log",
                         LOG_DIR / "pipewire.log",
@@ -1639,12 +1676,12 @@ def command_desktop_session(args):
         "plasmashell": None,
         "portal": [],
         "sunshine": None,
-        "input_bridge": None,
         "session_actions": None,
         "width": width,
         "height": height,
         "fps": fps,
         "scale": scale,
+        "audio_channels": default_audio_channels(),
     }
     control = None
     dbus_pid = ""
@@ -1694,7 +1731,6 @@ def command_desktop_session(args):
             remember_process(state, "sunshine", sunshine)
             if not wait_for_tcp_port("127.0.0.1", 47989, sunshine, args.ready_timeout):
                 raise StreamError("timed out waiting for Sunshine on TCP port 47989")
-            start_input_bridge_if_needed(args, desktop_env, state)
 
         eprint(f"arch-sunshine: Plasma Wayland desktop ready on {socket_path}")
         if args.smoke_seconds > 0:
@@ -1950,7 +1986,6 @@ def command_input_test(args):
     start_input_device_node_watcher()
 
     env = desktop_base_env(runtime_dir, f"unix:path={runtime_dir / 'bus'}", args.socket)
-    bridge = None
     keyboard_output = Path("/tmp/arch-sunshine-input-test-keyboard.txt")
     mouse_output = Path("/tmp/arch-sunshine-input-test-mouse.bin")
     for output in (keyboard_output, mouse_output):
@@ -1958,19 +1993,7 @@ def command_input_test(args):
             output.unlink()
         except FileNotFoundError:
             pass
-
-    bridge_probe = run_checked(
-        ["pgrep", "-u", str(DESKTOP_UID), "-f", "arch-sunshine-input-bridge"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    if bridge_probe.returncode != 0:
-        bridge = start_as_desktop_user(
-            ["/usr/local/bin/arch-sunshine-input-bridge", "--exit-on-error"],
-            env,
-            "input-bridge-test.log",
-        )
-        time.sleep(1.0)
+    test_processes = []
 
     try:
         keyboard_command = [
@@ -1985,17 +2008,10 @@ def command_input_test(args):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        test_processes.append(keyboard_process)
         time.sleep(args.warmup_seconds)
 
-        with UInputTestDevice() as device:
-            time.sleep(0.5)
-            sync_input_device_nodes()
-            run_checked(["udevadm", "trigger", "--action=add", "-s", "input"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            run_checked(["udevadm", "settle", "--timeout=2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            sync_input_device_nodes()
-            time.sleep(args.hotplug_seconds)
-
-            device.type_abc_enter()
+        run_libei_input_test(env, "keyboard")
 
         deadline = time.monotonic() + args.timeout
         while time.monotonic() < deadline and not keyboard_output.exists():
@@ -2036,24 +2052,9 @@ def command_input_test(args):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        test_processes.append(mouse_process)
         time.sleep(args.warmup_seconds)
-        with UInputTestDevice() as device:
-            time.sleep(0.5)
-            sync_input_device_nodes()
-            run_checked(["udevadm", "trigger", "--action=add", "-s", "input"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            run_checked(["udevadm", "settle", "--timeout=2"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            sync_input_device_nodes()
-            time.sleep(args.hotplug_seconds)
-            for dx, dy in ((120, 120), (-60, -60), (20, 20)):
-                device.move(dx, dy)
-                time.sleep(0.1)
-            device.click_left()
-            time.sleep(0.1)
-            device.click_middle()
-            time.sleep(0.1)
-            device.click_right()
-            time.sleep(0.1)
-            device.duplicate_middle_hold()
+        run_libei_input_test(env, "mouse")
 
         deadline = time.monotonic() + args.timeout + 2
         while time.monotonic() < deadline and mouse_process.poll() is None and not mouse_output.exists():
@@ -2085,17 +2086,18 @@ def command_input_test(args):
             print(f"input-test: mouse bytes {mouse_bytes!r}")
 
         if args.require_all and not (saw_motion and saw_button and saw_key and deduped_hold):
-            raise StreamError("input-test failed: bridged input events did not reach the Wayland clients")
+            raise StreamError("input-test failed: input events did not reach the Wayland clients")
         if not (saw_motion or saw_button or saw_key):
-            raise StreamError("input-test failed: no bridged input events reached the Wayland clients")
+            raise StreamError("input-test failed: no input events reached the Wayland clients")
         return 0
     finally:
-        if bridge is not None:
-            terminate_process(bridge)
+        for process in reversed(test_processes):
+            terminate_process(process)
 
 
 def command_client_start(_args):
     width, height, fps, scale = requested_client_geometry()
+    audio_channels = requested_audio_channels()
     ack_path = control_fifo_path().with_name(f"arch-sunshine-client-start-{os.getpid()}.done")
     try:
         ack_path.unlink()
@@ -2108,6 +2110,7 @@ def command_client_start(_args):
             "height": height,
             "fps": fps,
             "scale": scale,
+            "audio_channels": audio_channels,
             "ack": str(ack_path),
         }
     )
@@ -2120,12 +2123,12 @@ def command_client_start(_args):
                 pass
             return 0
         time.sleep(0.1)
-    raise StreamError("timed out waiting for desktop resize")
+    raise StreamError("timed out waiting for desktop stream setup")
 
 
 def command_client_stop(_args):
     try:
-        send_control_message({"command": "client-stop"})
+        send_control_message({"command": "client-stop", "audio_channels": default_audio_channels()})
     except StreamError as exc:
         eprint(f"arch-sunshine: {exc}")
     return 0
@@ -2304,7 +2307,6 @@ def build_parser():
     desktop.add_argument("--no-audio", action="store_true")
     desktop.add_argument("--no-sunshine", dest="no_sunshine", action="store_true")
     desktop.add_argument("--no-streamd", dest="no_sunshine", action="store_true", help=argparse.SUPPRESS)
-    desktop.add_argument("--no-input-bridge", action="store_true")
     desktop.add_argument("--no-xwayland", dest="xwayland", action="store_false")
     desktop.set_defaults(func=command_desktop_session, xwayland=True)
 
@@ -2320,7 +2322,6 @@ def build_parser():
     input_test.add_argument("--runtime-dir", default=os.environ.get("XDG_RUNTIME_DIR", str(DEFAULT_RUNTIME_DIR)))
     input_test.add_argument("--socket", default=os.environ.get("SUNSHINE_WAYLAND_SOCKET", DEFAULT_SOCKET))
     input_test.add_argument("--warmup-seconds", type=float, default=1.5)
-    input_test.add_argument("--hotplug-seconds", type=float, default=1.5)
     input_test.add_argument("--timeout", type=float, default=5)
     input_test.add_argument("--require-all", action="store_true")
     input_test.add_argument("--verbose", action="store_true")
