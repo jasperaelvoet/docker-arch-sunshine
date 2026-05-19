@@ -17,12 +17,29 @@ RUN printf '\nDisableSandbox\n' >> /etc/pacman.conf \
       openssl \
       pkgconf
 
-COPY build/container/src/ /usr/local/src/arch-sunshine/
+COPY build/container/src/arch-sunshine-libei-input.c /usr/local/src/arch-sunshine/arch-sunshine-libei-input.c
+COPY build/container/src/arch-sunshine-server.c /usr/local/src/arch-sunshine/arch-sunshine-server.c
 RUN mkdir -p /out \
     && cc -O2 -pipe -Wall -Wextra -fPIC -shared -o /out/arch-sunshine-libei-input.so /usr/local/src/arch-sunshine/arch-sunshine-libei-input.c $(pkg-config --cflags --libs gio-2.0 gio-unix-2.0 libei-1.0 libevdev) -ldl -pthread \
-    && cc -O2 -pipe -Wall -Wextra -o /out/arch-sunshine-libei-input-test /usr/local/src/arch-sunshine/arch-sunshine-libei-input-test.c $(pkg-config --cflags --libs libevdev) \
     && cc -O2 -pipe -Wall -Wextra -o /out/arch-sunshine-server /usr/local/src/arch-sunshine/arch-sunshine-server.c -lcrypto \
-    && strip /out/arch-sunshine-libei-input.so /out/arch-sunshine-libei-input-test /out/arch-sunshine-server
+    && strip /out/arch-sunshine-libei-input.so /out/arch-sunshine-server
+
+FROM --platform=linux/amd64 rust:1-slim-bookworm AS rust-builder
+
+WORKDIR /src
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Cache crate deps separately so source edits don't refetch/rebuild them.
+COPY build/container/src/arch-sunshine-rs/Cargo.toml build/container/src/arch-sunshine-rs/Cargo.lock /src/
+RUN mkdir -p /src/src && echo 'fn main() {}' > /src/src/main.rs \
+    && cargo build --release --locked \
+    && rm -rf /src/src /src/target/release/arch-sunshine* /src/target/release/deps/arch_sunshine*
+
+COPY build/container/src/arch-sunshine-rs/src /src/src
+RUN cargo build --release --locked \
+    && install -D target/release/arch-sunshine /out/arch-sunshine
 
 FROM --platform=linux/amd64 archlinux:base
 
@@ -169,9 +186,8 @@ COPY --chmod=755 build/container/bin/arch-sunshine-preseed-steam /usr/local/bin/
 RUN /usr/local/bin/arch-sunshine-preseed-steam
 
 COPY config/sunshine/ /usr/share/arch-sunshine/
-COPY --chmod=755 build/container/bin/arch-sunshine /usr/local/bin/arch-sunshine
+COPY --from=rust-builder --chmod=755 /out/arch-sunshine /usr/local/bin/arch-sunshine
 COPY --from=native-builder /out/arch-sunshine-libei-input.so /usr/local/lib/arch-sunshine-libei-input.so
-COPY --from=native-builder /out/arch-sunshine-libei-input-test /usr/local/bin/arch-sunshine-libei-input-test
 COPY --from=native-builder /out/arch-sunshine-server /usr/local/bin/arch-sunshine-server
 COPY --chmod=755 build/container/bin/arch-sunshine-network-status /usr/local/bin/arch-sunshine-network-status
 COPY --chmod=755 build/container/bin/arch-sunshine-pacman /usr/local/bin/arch-sunshine-pacman

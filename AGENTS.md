@@ -48,7 +48,8 @@ Moonlight, KDE Plasma, Steam, and Firefox.
 
 Before handing off meaningful runtime changes, at minimum check:
 
-- `python3 -m py_compile build/container/bin/arch-sunshine build/container/bin/arch-sunshine-network-status`
+- `cargo check --manifest-path build/container/src/arch-sunshine-rs/Cargo.toml`
+- `python3 -m py_compile build/container/bin/arch-sunshine-network-status`
 - `bash -n build/container/bin/arch-sunshine-pacman build/container/bin/arch-sunshine-steam build/container/bin/arch-sunshine-steamos-update build/container/bin/arch-sunshine-preseed-steam scripts/remote-sync scripts/remote-clean`
 - `python3 -m json.tool config/sunshine/pipelines.json >/dev/null`
 - `python3 -m json.tool config/sunshine/apps.json >/dev/null`
@@ -58,8 +59,6 @@ For GPU/audio fixes, verify from inside the running container:
 
 - `vulkaninfo --summary` sees the GPU.
 - `qdbus6 org.kde.KWin /KWin supportInformation` reports OpenGL compositing.
-- `arch-sunshine input-test --require-all` verifies that synthetic Linux input
-  events reach a Wayland client in the running desktop.
 - `pactl info` reports PulseAudio on PipeWire.
 - `pactl list short sinks` includes `arch_sunshine_audio`.
 - `curl http://127.0.0.1:47989/serverinfo` returns Sunshine server info.

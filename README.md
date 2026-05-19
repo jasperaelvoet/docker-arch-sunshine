@@ -47,12 +47,9 @@ Inside the container:
 ```sh
 arch-sunshine probe
 arch-sunshine desktop-session
-arch-sunshine input-test --require-all
 arch-sunshine-server pin 1234
 arch-sunshine pipeline --codec h264 --width 1920 --height 1080 --fps 60
-arch-sunshine stream-test --codec h264 --host 127.0.0.1 --port 5004
-arch-sunshine stream-test --codec hevc --host 127.0.0.1 --port 5006
-arch-sunshine stream-test --codec av1 --host 127.0.0.1 --port 5008
+arch-sunshine disconnect
 ```
 
 When Moonlight asks for pairing, attach to the container UI and press `r`, then
