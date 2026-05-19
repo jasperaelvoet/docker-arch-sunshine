@@ -6,16 +6,15 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::desktop::kde_config::{
-    apply_kde_scale_config, apply_kde_session_tweaks, build_kwin_command, ensure_plasma_launcher_defaults,
-    kactivitymanagerd_command,
+    apply_kde_scale_config, apply_kde_session_tweaks, build_kwin_command,
+    ensure_plasma_launcher_defaults, kactivitymanagerd_command,
 };
 use crate::desktop::pipewire::set_audio_defaults;
 use crate::desktop::process::{
-    run_as_desktop_user, run_as_desktop_user_quiet, spawn_as_desktop_user, terminate,
-    wait_for_dbus_name, wait_for_path, wait_for_process_name,
+    open_log_for_append, run_as_desktop_user, run_as_desktop_user_quiet, spawn_as_desktop_user,
+    terminate, wait_for_dbus_name, wait_for_path, wait_for_process_name,
 };
 use crate::desktop::{DesktopArgs, DesktopProcesses, StreamGeometry};
-use crate::paths::log_dir;
 
 pub async fn start_desktop_stack(
     args: &DesktopArgs,
@@ -38,6 +37,8 @@ pub async fn start_desktop_stack(
         &geometry.scale,
         false,
     );
+    apply_kde_session_tweaks(desktop_env);
+    crate::desktop::fs_setup::clear_kde_service_cache();
 
     let kwin_argv = build_kwin_command(
         &args.socket,
@@ -71,21 +72,9 @@ pub async fn start_desktop_stack(
         true,
     );
     let _ = run_as_desktop_user_quiet(&["xdg-user-dirs-update"], desktop_env);
-    apply_kde_session_tweaks(desktop_env);
-    crate::desktop::fs_setup::clear_kde_service_cache();
 
-    let log_path = log_dir().join("kbuildsycoca.log");
-    if let Some(parent) = log_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(output) =
-        run_as_desktop_user(&["kbuildsycoca6", "--noincremental"], desktop_env)
-    {
-        if let Ok(mut handle) = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
+    if let Ok(output) = run_as_desktop_user(&["kbuildsycoca6", "--noincremental"], desktop_env) {
+        if let Ok(mut handle) = open_log_for_append("kbuildsycoca.log") {
             let _ = handle.write_all(&output.stdout);
             let _ = handle.write_all(&output.stderr);
         }
@@ -94,8 +83,7 @@ pub async fn start_desktop_stack(
     state.kded = Some(spawn_as_desktop_user(&["kded6"], desktop_env, "kded6.log")?);
 
     if let Some(cmd) = kactivitymanagerd_command() {
-        let mut activities =
-            spawn_as_desktop_user(&cmd, desktop_env, "kactivitymanagerd.log")?;
+        let mut activities = spawn_as_desktop_user(&cmd, desktop_env, "kactivitymanagerd.log")?;
         if !wait_for_dbus_name(
             "org.kde.ActivityManager",
             desktop_env,

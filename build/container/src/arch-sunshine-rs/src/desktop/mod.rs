@@ -23,7 +23,7 @@ use crate::env_config::{
     sanitize_positive_int, sanitize_refresh_rate,
 };
 use crate::paths::{
-    control_fifo_path, log_dir, DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_RUNTIME_DIR, DEFAULT_SOCKET,
+    control_fifo_path, DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_RUNTIME_DIR, DEFAULT_SOCKET,
     DEFAULT_WIDTH,
 };
 
@@ -125,6 +125,7 @@ pub struct DesktopState {
 pub async fn start(args: DesktopArgs) -> Result<(DesktopState, ShutdownGuard)> {
     let runtime_dir = args.runtime_dir.clone();
     fs_setup::prepare_desktop_filesystem(&runtime_dir)?;
+    process::start_child_reaper();
     input_devices::start_input_device_node_watcher();
     fs_setup::write_wayland_desktop_config()?;
     process::kill_desktop_processes();
@@ -141,8 +142,11 @@ pub async fn start(args: DesktopArgs) -> Result<(DesktopState, ShutdownGuard)> {
 
     let session = dbus_bus::start_session_bus(&runtime_dir)?;
     let system_pid = dbus_bus::start_system_bus()?;
-    let compositor_env =
-        Arc::new(env::desktop_base_env(&runtime_dir, Some(&session.address), None));
+    let compositor_env = Arc::new(env::desktop_base_env(
+        &runtime_dir,
+        Some(&session.address),
+        None,
+    ));
     let desktop_env = Arc::new(env::desktop_base_env(
         &runtime_dir,
         Some(&session.address),
@@ -300,22 +304,8 @@ fn start_network_status() -> Option<Child> {
     if !bin.exists() {
         return None;
     }
-    let log_path = log_dir().join("network-status.log");
-    if let Some(parent) = log_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let log_handle = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .ok()?;
-    let stderr = log_handle.try_clone().ok()?;
-    tokio::process::Command::new(bin)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log_handle))
-        .stderr(std::process::Stdio::from(stderr))
-        .spawn()
-        .ok()
+    let bin = bin.to_str()?;
+    process::spawn_with_env(&[bin], &BTreeMap::new(), "network-status.log").ok()
 }
 
 pub async fn handle_control(state: &DesktopState, msg: control::ControlMessage) -> Result<()> {
@@ -375,11 +365,13 @@ pub async fn handle_control(state: &DesktopState, msg: control::ControlMessage) 
                 let _ = fs::write(&path, "ok\n");
                 process::chown_path(&path, false);
             }
+            schedule_audio_sink_cleanup(state, channels);
         }
         control::ControlMessage::ClientStop { .. } => {
             let channels = default_audio_channels();
             *state.audio_channels.lock().await = channels;
             pipewire::ensure_audio_sink(&state.desktop_env, Some(channels))?;
+            schedule_audio_sink_cleanup(state, channels);
             let (width, height, fps, scale) = default_geometry();
             restart_geometry(
                 state,
@@ -394,6 +386,29 @@ pub async fn handle_control(state: &DesktopState, msg: control::ControlMessage) 
         }
     }
     Ok(())
+}
+
+fn schedule_audio_sink_cleanup(state: &DesktopState, channels: u32) {
+    if state.args.no_audio {
+        return;
+    }
+    let env = state.desktop_env.clone();
+    tokio::spawn(async move {
+        for delay in [
+            Duration::from_millis(750),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+        ] {
+            tokio::time::sleep(delay).await;
+            let env = env.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(e) = pipewire::ensure_audio_sink(&env, Some(channels)) {
+                    eprintln!("arch-sunshine: delayed audio sink cleanup failed: {e}");
+                }
+            })
+            .await;
+        }
+    });
 }
 
 async fn restart_geometry(
@@ -414,10 +429,7 @@ async fn restart_geometry(
         .as_mut()
         .map(|c| c.try_wait().ok().flatten().is_none())
         .unwrap_or(false);
-    if kwin_alive
-        && geometry.width == width
-        && geometry.height == height
-        && geometry.scale == scale
+    if kwin_alive && geometry.width == width && geometry.height == height && geometry.scale == scale
     {
         geometry.fps = fps;
         return Ok(());

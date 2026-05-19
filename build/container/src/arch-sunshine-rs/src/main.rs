@@ -14,8 +14,12 @@ use std::time::{Duration, Instant};
 
 use crate::desktop::control::send_control_message_sync;
 use crate::desktop::session_actions::Credentials;
-use crate::encoder::{build_pipeline, encoder_status, load_config, PipelineConfig, PipelineRequest};
-use crate::env_config::{default_audio_channels, requested_audio_channels, requested_client_geometry};
+use crate::encoder::{
+    build_pipeline, encoder_status, hardware_probe, load_config, PipelineConfig, PipelineRequest,
+};
+use crate::env_config::{
+    default_audio_channels, requested_audio_channels, requested_client_geometry,
+};
 use crate::paths::{control_fifo_path, DEFAULT_CONFIG, DEFAULT_RUNTIME_DIR, DEFAULT_SOCKET};
 
 #[derive(Parser)]
@@ -78,7 +82,11 @@ struct PipelineArgs {
     encoder: String,
     #[arg(long, value_parser = ["test", "pipewire"], default_value = "test")]
     source: String,
-    #[arg(long = "pipewire-node", env = "SUNSHINE_PIPEWIRE_NODE", default_value = "0")]
+    #[arg(
+        long = "pipewire-node",
+        env = "SUNSHINE_PIPEWIRE_NODE",
+        default_value = "0"
+    )]
     pipewire_node: String,
     #[arg(long, env = "SUNSHINE_WIDTH", default_value = "1920")]
     width: u32,
@@ -88,9 +96,17 @@ struct PipelineArgs {
     fps: u32,
     #[arg(long, env = "SUNSHINE_BITRATE_KBPS", default_value = "25000")]
     bitrate: u32,
-    #[arg(long = "vbv-buffer", env = "SUNSHINE_VBV_KBITS", default_value = "25000")]
+    #[arg(
+        long = "vbv-buffer",
+        env = "SUNSHINE_VBV_KBITS",
+        default_value = "25000"
+    )]
     vbv_buffer: u32,
-    #[arg(long = "payload-mtu", env = "SUNSHINE_PAYLOAD_MTU", default_value = "1200")]
+    #[arg(
+        long = "payload-mtu",
+        env = "SUNSHINE_PAYLOAD_MTU",
+        default_value = "1200"
+    )]
     payload_mtu: u32,
     #[arg(long, env = "SUNSHINE_UDP_HOST", default_value = "127.0.0.1")]
     host: String,
@@ -112,7 +128,11 @@ struct DesktopSessionArgs {
     fps: Option<String>,
     #[arg(long)]
     scale: Option<String>,
-    #[arg(long = "ready-timeout", env = "SUNSHINE_READY_TIMEOUT", default_value = "30")]
+    #[arg(
+        long = "ready-timeout",
+        env = "SUNSHINE_READY_TIMEOUT",
+        default_value = "30"
+    )]
     ready_timeout: f64,
     #[arg(long = "smoke-seconds", default_value = "0")]
     smoke_seconds: f64,
@@ -162,6 +182,18 @@ fn probe(config_path: &std::path::Path) -> Result<()> {
         serde_json::Value::Bool(which::which("weston")),
     );
     payload.insert(
+        "vainfo".to_string(),
+        serde_json::Value::Bool(which::which("vainfo")),
+    );
+    payload.insert(
+        "vulkaninfo".to_string(),
+        serde_json::Value::Bool(which::which("vulkaninfo")),
+    );
+    payload.insert(
+        "hardware".to_string(),
+        serde_json::to_value(hardware_probe())?,
+    );
+    payload.insert(
         "encoders".to_string(),
         serde_json::to_value(encoder_status(&config))?,
     );
@@ -173,9 +205,7 @@ fn probe(config_path: &std::path::Path) -> Result<()> {
 mod which {
     pub fn which(name: &str) -> bool {
         std::env::var_os("PATH")
-            .map(|path| {
-                std::env::split_paths(&path).any(|dir| dir.join(name).is_file())
-            })
+            .map(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
             .unwrap_or(false)
     }
 }
@@ -218,7 +248,9 @@ fn client_start() -> Result<()> {
     let audio_channels = requested_audio_channels();
     let pid = std::process::id();
     let path = control_fifo_path(None);
-    let ack_dir = path.parent().unwrap_or_else(|| std::path::Path::new("/tmp"));
+    let ack_dir = path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("/tmp"));
     let ack_path = ack_dir.join(format!("arch-sunshine-client-start-{pid}.done"));
     let _ = std::fs::remove_file(&ack_path);
     let message = serde_json::json!({

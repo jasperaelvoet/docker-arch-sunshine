@@ -7,8 +7,7 @@ use crate::desktop::process::{
     chown_path, command_available, run_as_desktop_user, run_as_desktop_user_quiet,
 };
 use crate::env_config::{
-    format_scale, kwin_virtual_geometry, plasma_scale_dpi, plasma_screen_scale_factors,
-    scale_value,
+    format_scale, kwin_virtual_geometry, plasma_scale_dpi, plasma_screen_scale_factors, scale_value,
 };
 use crate::paths::{home_dir, KWIN_OUTPUT_NAMES};
 
@@ -45,7 +44,9 @@ pub fn sync_x11_resources(env: &BTreeMap<String, String>) {
 
 pub fn update_kwin_output_config(width: u32, height: u32, fps: &str, scale: &str) -> Result<()> {
     let path = config_file("kwinoutputconfig.json");
-    let Ok(text) = fs::read_to_string(&path) else { return Ok(()) };
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Ok(());
+    };
     let Ok(mut config): std::result::Result<serde_json::Value, _> = serde_json::from_str(&text)
     else {
         return Ok(());
@@ -116,7 +117,13 @@ pub fn apply_kde_scale_config(
         "ScreenScaleFactors",
         &plasma_screen_scale_factors(scale),
     );
-    run_kwriteconfig(env, "kdeglobals", &["KScreen"], "XwaylandClientsScale", "true");
+    run_kwriteconfig(
+        env,
+        "kdeglobals",
+        &["KScreen"],
+        "XwaylandClientsScale",
+        "true",
+    );
     run_kwriteconfig(env, "kdeglobals", &["General"], "Xft.dpi", &dpi);
     run_kwriteconfig(env, "kwinrc", &["Xwayland"], "Scale", &scale_text);
     let _ = update_kwin_output_config(width, height, fps, scale);
@@ -133,9 +140,71 @@ pub fn apply_kde_scale_config(
 }
 
 pub fn apply_kde_session_tweaks(env: &BTreeMap<String, String>) {
-    run_kwriteconfig(env, "kded6rc", &["Module-kscreen"], "autoload", "false");
+    for module in [
+        "Module-appmenu",
+        "Module-baloosearchmodule",
+        "Module-bluedevil",
+        "Module-device_automounter",
+        "Module-gtkconfig",
+        "Module-kscreen",
+        "Module-kwallet",
+        "Module-networkmanagement",
+        "Module-powerdevil",
+        "Module-printmanager",
+        "Module-proxyscout",
+        "Module-wacomtablet",
+    ] {
+        run_kwriteconfig(env, "kded6rc", &[module], "autoload", "false");
+    }
+
+    run_kwriteconfig(env, "kdeglobals", &["KDE"], "AnimationDurationFactor", "0");
+    run_kwriteconfig(env, "kwinrc", &["Compositing"], "AnimationSpeed", "0");
+    run_kwriteconfig(
+        env,
+        "kwinrc",
+        &["Compositing"],
+        "LatencyPolicy",
+        "ExtremelyLow",
+    );
+    run_kwriteconfig(env, "kwinrc", &["Compositing"], "GLPreferBufferSwap", "a");
+    for plugin in [
+        "blurEnabled",
+        "contrastEnabled",
+        "desktopgridEnabled",
+        "fadingpopupsEnabled",
+        "fullscreenEnabled",
+        "loginEnabled",
+        "logoutEnabled",
+        "magiclampEnabled",
+        "maximizeEnabled",
+        "morphingpopupsEnabled",
+        "overviewEnabled",
+        "presentwindowsEnabled",
+        "scaleEnabled",
+        "screenedgeEnabled",
+        "slideEnabled",
+        "slidingpopupsEnabled",
+        "squashEnabled",
+        "tileseditorEnabled",
+        "windowapertureEnabled",
+        "windowviewEnabled",
+        "wobblywindowsEnabled",
+        "zoomEnabled",
+    ] {
+        run_kwriteconfig(env, "kwinrc", &["Plugins"], plugin, "false");
+    }
+
+    run_kwriteconfig(env, "kwalletrc", &["Wallet"], "Enabled", "false");
+    run_kwriteconfig(env, "kwalletrc", &["Wallet"], "First Use", "false");
+
     for key in ["action/lock_screen", "lock_screen"] {
-        run_kwriteconfig(env, "kdeglobals", &["KDE Action Restrictions"], key, "false");
+        run_kwriteconfig(
+            env,
+            "kdeglobals",
+            &["KDE Action Restrictions"],
+            key,
+            "false",
+        );
     }
     let kdeglobals = config_file("kdeglobals");
     if let Ok(text) = fs::read_to_string(&kdeglobals) {
@@ -150,10 +219,27 @@ pub fn apply_kde_session_tweaks(env: &BTreeMap<String, String>) {
             "[KDE Action Restrictions][$i]\n",
         );
         let _ = fs::write(&kdeglobals, new_text);
+        chown_path(&kdeglobals, false);
+    }
+
+    let portal_dir = home_dir().join(".config").join("xdg-desktop-portal");
+    let portal_config = portal_dir.join("portals.conf");
+    if fs::create_dir_all(&portal_dir).is_ok() {
+        let _ = fs::write(
+            &portal_config,
+            "[preferred]\ndefault=kde\norg.freedesktop.impl.portal.ScreenCast=kde\norg.freedesktop.impl.portal.RemoteDesktop=kde\n",
+        );
+        chown_path(&portal_dir, true);
     }
 }
 
-pub fn build_kwin_command(socket: &str, xwayland: bool, width: u32, height: u32, scale: &str) -> Vec<String> {
+pub fn build_kwin_command(
+    socket: &str,
+    xwayland: bool,
+    width: u32,
+    height: u32,
+    scale: &str,
+) -> Vec<String> {
     let (logical_w, logical_h) = kwin_virtual_geometry(width, height, scale);
     let mut command: Vec<String> = vec![
         "kwin_wayland".into(),

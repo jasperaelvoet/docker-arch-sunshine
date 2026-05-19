@@ -17,7 +17,10 @@ pub fn desktop_base_env(
     env.insert("LC_CTYPE".into(), "en_US.UTF-8".into());
     env.insert("LC_MESSAGES".into(), "en_US.UTF-8".into());
     env.insert("LANGUAGE".into(), "en_US".into());
-    env.insert("XDG_RUNTIME_DIR".into(), runtime_dir.to_string_lossy().into());
+    env.insert(
+        "XDG_RUNTIME_DIR".into(),
+        runtime_dir.to_string_lossy().into(),
+    );
     env.insert(
         "XDG_CONFIG_HOME".into(),
         home.join(".config").to_string_lossy().into(),
@@ -49,6 +52,9 @@ pub fn desktop_base_env(
         "PULSE_SERVER".into(),
         format!("unix:{}/pulse/native", runtime_dir.display()),
     );
+    env.insert("PIPEWIRE_DEBUG".into(), "1".into());
+    env.insert("PIPEWIRE_LOG".into(), "1".into());
+    env.insert("WIREPLUMBER_LOG_LEVEL".into(), "2".into());
     env.insert("STEAM_RUNTIME".into(), "1".into());
     env.insert("SRT_URLOPEN_PREFER_STEAM".into(), "1".into());
     env.insert("STEAM_DISABLE_AUDIO_DEVICE_SWITCHING".into(), "1".into());
@@ -67,4 +73,3 @@ pub fn desktop_base_env(
     }
     env
 }
-

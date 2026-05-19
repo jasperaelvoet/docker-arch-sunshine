@@ -14,6 +14,7 @@ RUN printf '\nDisableSandbox\n' >> /etc/pacman.conf \
       glib2 \
       libei \
       libevdev \
+      libcap \
       openssl \
       pkgconf
 
@@ -21,7 +22,7 @@ COPY build/container/src/arch-sunshine-libei-input.c /usr/local/src/arch-sunshin
 COPY build/container/src/arch-sunshine-server.c /usr/local/src/arch-sunshine/arch-sunshine-server.c
 RUN mkdir -p /out \
     && cc -O2 -pipe -Wall -Wextra -fPIC -shared -o /out/arch-sunshine-libei-input.so /usr/local/src/arch-sunshine/arch-sunshine-libei-input.c $(pkg-config --cflags --libs gio-2.0 gio-unix-2.0 libei-1.0 libevdev) -ldl -pthread \
-    && cc -O2 -pipe -Wall -Wextra -o /out/arch-sunshine-server /usr/local/src/arch-sunshine/arch-sunshine-server.c -lcrypto \
+    && cc -O2 -pipe -Wall -Wextra -o /out/arch-sunshine-server /usr/local/src/arch-sunshine/arch-sunshine-server.c -lcrypto -lcap \
     && strip /out/arch-sunshine-libei-input.so /out/arch-sunshine-server
 
 FROM --platform=linux/amd64 rust:1-slim-bookworm AS rust-builder
@@ -202,6 +203,7 @@ RUN install -d -m 1777 /var/lib/xkb \
     && chmod 1777 /tmp \
     && install -d -m 755 /usr/lib/arch-sunshine \
     && rm -f /usr/lib/qt6/plugins/plasma/applets/org.kde.plasma.kickoff.so \
+    && rm -f /usr/share/xdg-desktop-portal/portals/gtk.portal /usr/share/xdg-desktop-portal/portals/kwallet.portal \
     && mv /usr/bin/pacman /usr/lib/arch-sunshine/pacman.real \
     && (setcap cap_net_raw+ep /usr/bin/ping || chmod 4755 /usr/bin/ping) \
     && setcap cap_sys_admin,cap_sys_nice+ep /usr/bin/sunshine \

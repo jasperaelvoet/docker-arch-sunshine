@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/capability.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -32,6 +34,17 @@
 static const char *env_or_default(const char *name, const char *fallback) {
     const char *value = getenv(name);
     return value && *value ? value : fallback;
+}
+
+static bool env_flag_enabled(const char *name, bool fallback) {
+    const char *value = getenv(name);
+    if (!value || !*value) {
+        return fallback;
+    }
+    return strcasecmp(value, "0") != 0 &&
+           strcasecmp(value, "false") != 0 &&
+           strcasecmp(value, "no") != 0 &&
+           strcasecmp(value, "off") != 0;
 }
 
 static int mkdir_p(const char *path, mode_t mode) {
@@ -75,11 +88,42 @@ static int chmod_path(const char *path, mode_t mode) {
     return 0;
 }
 
-static int drop_to_desktop_user(void) {
+static int grant_sunshine_capabilities(void) {
+    cap_value_t caps_to_keep[] = {
+        CAP_SYS_NICE,
+        CAP_SYS_ADMIN,
+    };
+    const int cap_count = (int)(sizeof(caps_to_keep) / sizeof(caps_to_keep[0]));
+
+    cap_t caps = cap_get_proc();
+    if (!caps) {
+        return -1;
+    }
+    if (cap_set_flag(caps, CAP_PERMITTED, cap_count, caps_to_keep, CAP_SET) != 0 ||
+        cap_set_flag(caps, CAP_EFFECTIVE, cap_count, caps_to_keep, CAP_SET) != 0 ||
+        cap_set_flag(caps, CAP_INHERITABLE, cap_count, caps_to_keep, CAP_SET) != 0 ||
+        cap_set_proc(caps) != 0) {
+        cap_free(caps);
+        return -1;
+    }
+    cap_free(caps);
+
+    for (int i = 0; i < cap_count; i++) {
+        if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, caps_to_keep[i], 0, 0) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int drop_to_desktop_user(bool keep_capabilities) {
     const char *user = env_or_default("SUNSHINE_DESKTOP_USER", "sunshine");
     struct passwd *pw = getpwnam(user);
     if (!pw) {
         errno = ENOENT;
+        return -1;
+    }
+    if (keep_capabilities && prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) != 0) {
         return -1;
     }
     if (initgroups(user, pw->pw_gid) != 0) {
@@ -89,6 +133,9 @@ static int drop_to_desktop_user(void) {
         return -1;
     }
     if (setuid(pw->pw_uid) != 0) {
+        return -1;
+    }
+    if (keep_capabilities && prctl(PR_SET_KEEPCAPS, 0, 0, 0, 0) != 0) {
         return -1;
     }
     return 0;
@@ -225,7 +272,6 @@ static int write_config(void) {
         "global_prep_cmd = [{\"do\":\"/usr/local/bin/arch-sunshine client-start\",\"undo\":\"/usr/local/bin/arch-sunshine client-stop\"}]\n"
         "stream_audio = enabled\n"
         "audio_sink = arch_sunshine_audio\n"
-        "virtual_sink = arch_sunshine_audio\n"
         "gamepad = xone\n"
         "motion_as_ds4 = disabled\n"
         "touchpad_as_ds4 = disabled\n");
@@ -433,9 +479,13 @@ static int command_serve(void) {
 
     pid_t sunshine_pid = fork();
     if (sunshine_pid == 0) {
-        if (drop_to_desktop_user() != 0) {
+        bool keep_caps = env_flag_enabled("SUNSHINE_REALTIME_CAPS", true);
+        if (drop_to_desktop_user(keep_caps) != 0) {
             perror("arch-sunshine-server: drop privileges");
             _exit(127);
+        }
+        if (keep_caps && grant_sunshine_capabilities() != 0) {
+            perror("arch-sunshine-server: grant Sunshine realtime capabilities");
         }
         setenv("ARCH_SUNSHINE_LIBEI_INPUT", "1", 1);
         execl(

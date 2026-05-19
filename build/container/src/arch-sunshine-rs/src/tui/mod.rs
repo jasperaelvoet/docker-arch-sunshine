@@ -214,7 +214,9 @@ async fn run_loop(
 
 async fn pump_control(state: &DesktopState, guard: &ShutdownGuard) {
     let mut control_lock = guard.control.lock().await;
-    let Some(channel) = control_lock.as_mut() else { return };
+    let Some(channel) = control_lock.as_mut() else {
+        return;
+    };
     let messages = channel.read_messages().await;
     drop(control_lock);
     for msg in messages {
@@ -260,22 +262,24 @@ async fn build_fast_status(state: &DesktopState) -> StatusSnapshot {
 }
 
 async fn build_slow_status(state: &DesktopState) -> (String, Vec<(String, Option<String>)>) {
-    let env = (*state.desktop_env).clone();
-    let audio_sink = tokio::task::spawn_blocking(move || {
-        crate::desktop::pipewire::audio_status_summary(&env)
-    })
-    .await
-    .unwrap_or_else(|_| "?".into());
+    let audio_sink = if state.args.no_audio {
+        "disabled".into()
+    } else {
+        let channels = *state.audio_channels.lock().await;
+        format!("{} {}ch", crate::paths::AUDIO_SINK_NAME, channels)
+    };
     let encoders = compute_encoder_summary().await;
     (audio_sink, encoders)
 }
 
 fn child_health(child: &mut Option<tokio::process::Child>) -> Health {
-    let Some(c) = child.as_mut() else { return Health::Unknown };
+    let Some(c) = child.as_mut() else {
+        return Health::Unknown;
+    };
     match c.try_wait() {
         Ok(None) => Health::Up,
         Ok(Some(_)) => Health::Down,
-        Err(_) => Health::Unknown,
+        Err(_) => Health::Down,
     }
 }
 

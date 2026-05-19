@@ -3,10 +3,24 @@ use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Once;
 use std::time::{Duration, Instant};
 use tokio::process::Child;
 
-use crate::paths::{desktop_user, log_dir, DESKTOP_UID};
+use crate::paths::{log_dir, DESKTOP_GID, DESKTOP_UID};
+
+static REAPER_STARTED: Once = Once::new();
+
+pub fn start_child_reaper() {
+    REAPER_STARTED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("arch-sunshine-reaper".into())
+            .spawn(|| loop {
+                reap_orphaned_children();
+                std::thread::sleep(Duration::from_millis(500));
+            });
+    });
+}
 
 pub fn run_checked(command: &[&str]) -> std::io::Result<std::process::Output> {
     Command::new(command[0])
@@ -53,26 +67,37 @@ pub fn env_args(env: &BTreeMap<String, String>) -> Vec<String> {
     env.iter().map(|(k, v)| format!("{k}={v}")).collect()
 }
 
-pub fn run_as_desktop_user(command: &[&str], env: &BTreeMap<String, String>) -> std::io::Result<std::process::Output> {
-    let env_pairs = env_args(env);
-    let mut args: Vec<&str> = vec!["runuser", "-u", desktop_user(), "--", "env"];
-    let env_str: Vec<&str> = env_pairs.iter().map(|s| s.as_str()).collect();
-    args.extend(env_str.iter().copied());
-    args.extend(command.iter().copied());
-    Command::new(args[0])
-        .args(&args[1..])
+fn desktop_user_argv(command: &[&str], env: &BTreeMap<String, String>) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
+        "setpriv".into(),
+        "--reuid".into(),
+        DESKTOP_UID.to_string(),
+        "--regid".into(),
+        DESKTOP_GID.to_string(),
+        "--init-groups".into(),
+        "--".into(),
+        "env".into(),
+    ];
+    argv.extend(env_args(env));
+    argv.extend(command.iter().map(|s| s.to_string()));
+    argv
+}
+
+pub fn run_as_desktop_user(
+    command: &[&str],
+    env: &BTreeMap<String, String>,
+) -> std::io::Result<std::process::Output> {
+    let argv = desktop_user_argv(command, env);
+    Command::new(&argv[0])
+        .args(&argv[1..])
         .stdin(Stdio::null())
         .output()
 }
 
 pub fn run_as_desktop_user_quiet(command: &[&str], env: &BTreeMap<String, String>) -> bool {
-    let env_pairs = env_args(env);
-    let mut args: Vec<&str> = vec!["runuser", "-u", desktop_user(), "--", "env"];
-    let env_str: Vec<&str> = env_pairs.iter().map(|s| s.as_str()).collect();
-    args.extend(env_str.iter().copied());
-    args.extend(command.iter().copied());
-    Command::new(args[0])
-        .args(&args[1..])
+    let argv = desktop_user_argv(command, env);
+    Command::new(&argv[0])
+        .args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -81,16 +106,51 @@ pub fn run_as_desktop_user_quiet(command: &[&str], env: &BTreeMap<String, String
         .unwrap_or(false)
 }
 
-fn open_log_for_append(log_name: &str) -> Result<std::fs::File> {
+fn max_log_bytes() -> u64 {
+    std::env::var("ARCH_SUNSHINE_LOG_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|v| *v >= 1024 * 1024)
+        .unwrap_or(16 * 1024 * 1024)
+}
+
+fn rotate_log_if_needed(path: &Path) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if metadata.len() < max_log_bytes() {
+        return;
+    }
+    let rotated = path.with_extension(format!(
+        "{}.1",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("log")
+    ));
+    let _ = std::fs::remove_file(&rotated);
+    let _ = std::fs::rename(path, rotated);
+}
+
+pub fn open_log_for_append(log_name: &str) -> Result<std::fs::File> {
     let path = log_dir().join(log_name);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
+    rotate_log_if_needed(&path);
     OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
         .with_context(|| format!("opening log file {}", path.display()))
+}
+
+fn start_new_session(command: &mut tokio::process::Command) {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 pub fn spawn_as_desktop_user(
@@ -100,12 +160,11 @@ pub fn spawn_as_desktop_user(
 ) -> Result<Child> {
     let log_handle = open_log_for_append(log_name)?;
     let stderr = log_handle.try_clone()?;
-    let env_pairs = env_args(env);
-    let mut argv: Vec<String> = vec!["runuser".into(), "-u".into(), desktop_user().into(), "--".into(), "env".into()];
-    argv.extend(env_pairs);
-    argv.extend(command.iter().map(|s| s.to_string()));
+    let argv = desktop_user_argv(command, env);
 
-    let child = tokio::process::Command::new(&argv[0])
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    start_new_session(&mut cmd);
+    let child = cmd
         .args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_handle))
@@ -127,7 +186,9 @@ pub fn spawn_with_env(
     argv.extend(env_pairs);
     argv.extend(command.iter().map(|s| s.to_string()));
 
-    let child = tokio::process::Command::new(&argv[0])
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    start_new_session(&mut cmd);
+    let child = cmd
         .args(&argv[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_handle))
@@ -137,21 +198,32 @@ pub fn spawn_with_env(
     Ok(child)
 }
 
+fn signal_process_group(pid: u32, signal: nix::sys::signal::Signal) {
+    let pgid = nix::unistd::Pid::from_raw(-(pid as i32));
+    if nix::sys::signal::kill(pgid, signal).is_err() {
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal);
+    }
+}
+
 pub async fn terminate(child: &mut Option<Child>) {
-    let Some(mut process) = child.take() else { return };
-    if process.try_wait().ok().flatten().is_some() {
+    let Some(mut process) = child.take() else {
         return;
+    };
+    match process.try_wait() {
+        Ok(Some(_)) | Err(_) => return,
+        Ok(None) => {}
     }
     let pid = process.id();
     if let Some(pid) = pid {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGTERM,
-        );
+        signal_process_group(pid, nix::sys::signal::Signal::SIGTERM);
     }
     let wait = tokio::time::timeout(Duration::from_secs(3), process.wait()).await;
     if wait.is_err() {
-        let _ = process.kill().await;
+        if let Some(pid) = pid {
+            signal_process_group(pid, nix::sys::signal::Signal::SIGKILL);
+        } else {
+            let _ = process.kill().await;
+        }
         let _ = process.wait().await;
     }
 }
@@ -179,14 +251,7 @@ pub fn kill_desktop_processes() {
         "wireplumber",
         "pipewire",
     ] {
-        let _ = run_checked(&[
-            "pkill",
-            "-TERM",
-            "-u",
-            &DESKTOP_UID.to_string(),
-            "-x",
-            name,
-        ]);
+        let _ = run_checked(&["pkill", "-TERM", "-u", &DESKTOP_UID.to_string(), "-x", name]);
     }
     let _ = run_checked(&[
         "pkill",
@@ -196,6 +261,21 @@ pub fn kill_desktop_processes() {
         "-f",
         "/usr/lib/kactivitymanagerd",
     ]);
+    reap_orphaned_children();
+}
+
+pub fn reap_orphaned_children() {
+    loop {
+        match nix::sys::wait::waitpid(
+            nix::unistd::Pid::from_raw(-1),
+            Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+        ) {
+            Ok(nix::sys::wait::WaitStatus::StillAlive) => break,
+            Ok(_) => continue,
+            Err(nix::errno::Errno::ECHILD) => break,
+            Err(_) => break,
+        }
+    }
 }
 
 pub fn wait_for_path_sync(path: &Path, timeout: Duration) -> bool {
@@ -217,8 +297,9 @@ pub async fn wait_for_path(path: &Path, child: Option<&mut Child>, timeout: Dura
             return true;
         }
         if let Some(c) = child.as_deref_mut() {
-            if let Ok(Some(_)) = c.try_wait() {
-                return false;
+            match c.try_wait() {
+                Ok(Some(_)) | Err(_) => return false,
+                Ok(None) => {}
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -226,7 +307,11 @@ pub async fn wait_for_path(path: &Path, child: Option<&mut Child>, timeout: Dura
     false
 }
 
-pub async fn wait_for_process_name(name: &str, child: Option<&mut Child>, timeout: Duration) -> bool {
+pub async fn wait_for_process_name(
+    name: &str,
+    child: Option<&mut Child>,
+    timeout: Duration,
+) -> bool {
     let deadline = Instant::now() + timeout;
     let mut child = child;
     while Instant::now() < deadline {
@@ -234,8 +319,9 @@ pub async fn wait_for_process_name(name: &str, child: Option<&mut Child>, timeou
             return true;
         }
         if let Some(c) = child.as_deref_mut() {
-            if let Ok(Some(_)) = c.try_wait() {
-                return false;
+            match c.try_wait() {
+                Ok(Some(_)) | Err(_) => return false,
+                Ok(None) => {}
             }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -243,7 +329,12 @@ pub async fn wait_for_process_name(name: &str, child: Option<&mut Child>, timeou
     false
 }
 
-pub async fn wait_for_tcp_port(host: &str, port: u16, child: Option<&mut Child>, timeout: Duration) -> bool {
+pub async fn wait_for_tcp_port(
+    host: &str,
+    port: u16,
+    child: Option<&mut Child>,
+    timeout: Duration,
+) -> bool {
     let deadline = Instant::now() + timeout;
     let mut child = child;
     while Instant::now() < deadline {
@@ -258,8 +349,9 @@ pub async fn wait_for_tcp_port(host: &str, port: u16, child: Option<&mut Child>,
             return true;
         }
         if let Some(c) = child.as_deref_mut() {
-            if let Ok(Some(_)) = c.try_wait() {
-                return false;
+            match c.try_wait() {
+                Ok(Some(_)) | Err(_) => return false,
+                Ok(None) => {}
             }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -277,8 +369,9 @@ pub async fn wait_for_dbus_name(
     let mut child = child;
     while Instant::now() < deadline {
         if let Some(c) = child.as_deref_mut() {
-            if let Ok(Some(_)) = c.try_wait() {
-                return false;
+            match c.try_wait() {
+                Ok(Some(_)) | Err(_) => return false,
+                Ok(None) => {}
             }
         }
         let output = run_as_desktop_user(

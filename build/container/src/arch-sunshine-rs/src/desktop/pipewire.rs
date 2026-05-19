@@ -1,14 +1,13 @@
 use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 use tokio::process::Child;
 
 use crate::desktop::process::{
-    command_available, run_as_desktop_user, run_as_desktop_user_quiet, spawn_as_desktop_user,
-    terminate, wait_for_path,
+    command_available, open_log_for_append, run_as_desktop_user, run_as_desktop_user_quiet,
+    spawn_as_desktop_user, terminate, wait_for_path,
 };
 use crate::env_config::{default_audio_channels, sanitize_audio_channels};
 use crate::paths::{audio_channel_map, log_dir, AUDIO_SINK_DESCRIPTION, AUDIO_SINK_NAME};
@@ -41,7 +40,11 @@ pub async fn start_pipewire_stack(
         ));
     }
 
-    let wireplumber = Some(spawn_as_desktop_user(&["wireplumber"], env, "wireplumber.log")?);
+    let wireplumber = Some(spawn_as_desktop_user(
+        &["wireplumber"],
+        env,
+        "wireplumber.log",
+    )?);
     let mut pulse = Some(spawn_as_desktop_user(
         &["pipewire-pulse"],
         env,
@@ -68,6 +71,7 @@ pub async fn start_pipewire_stack(
         ));
     }
 
+    cleanup_sunshine_virtual_sinks(env);
     ensure_audio_sink(env, Some(default_audio_channels()))?;
 
     Ok(PipewireStack {
@@ -211,10 +215,68 @@ pub fn move_audio_streams_to_sink(env: &BTreeMap<String, String>) {
     for line in stdout.lines() {
         let mut parts = line.split_whitespace();
         let Some(id) = parts.next() else { continue };
-        let _ = run_as_desktop_user_quiet(
-            &["pactl", "move-sink-input", id, AUDIO_SINK_NAME],
-            env,
-        );
+        let _ = run_as_desktop_user_quiet(&["pactl", "move-sink-input", id, AUDIO_SINK_NAME], env);
+    }
+}
+
+#[derive(Debug, Default)]
+struct SinkModule {
+    name: Option<String>,
+    owner_module: Option<String>,
+}
+
+fn sunshine_virtual_sink_modules(env: &BTreeMap<String, String>) -> Vec<String> {
+    let Ok(out) = run_as_desktop_user(&["pactl", "list", "sinks"], env) else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut modules = Vec::new();
+    let mut current = SinkModule::default();
+
+    for raw_line in stdout.lines() {
+        let line = raw_line.trim();
+        if raw_line.starts_with("Sink #") {
+            if current
+                .name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("sink-sunshine-"))
+            {
+                if let Some(owner) = current.owner_module.take() {
+                    modules.push(owner);
+                }
+            }
+            current = SinkModule::default();
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("Name:") {
+            current.name = Some(rest.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("Owner Module:") {
+            let owner = rest.trim();
+            if owner.chars().all(|c| c.is_ascii_digit()) {
+                current.owner_module = Some(owner.to_string());
+            }
+        }
+    }
+    if current
+        .name
+        .as_deref()
+        .is_some_and(|name| name.starts_with("sink-sunshine-"))
+    {
+        if let Some(owner) = current.owner_module {
+            modules.push(owner);
+        }
+    }
+    modules.sort();
+    modules.dedup();
+    modules
+}
+
+pub fn cleanup_sunshine_virtual_sinks(env: &BTreeMap<String, String>) {
+    for owner in sunshine_virtual_sink_modules(env) {
+        let _ = run_as_desktop_user_quiet(&["pactl", "unload-module", &owner], env);
     }
 }
 
@@ -225,6 +287,7 @@ pub fn ensure_audio_sink(env: &BTreeMap<String, String>, channels: Option<u32>) 
     let channel_map = audio_channel_map(channels)
         .ok_or_else(|| anyhow!("unsupported audio channel count: {channels}"))?;
 
+    cleanup_sunshine_virtual_sinks(env);
     let mut details = audio_sink_details(env);
     if details.name.is_some() && details.channels != Some(channels) {
         let Some(owner) = details.owner_module.clone() else {
@@ -232,15 +295,7 @@ pub fn ensure_audio_sink(env: &BTreeMap<String, String>, channels: Option<u32>) 
                 "cannot recreate {AUDIO_SINK_NAME}: owner module is unknown"
             ));
         };
-        let log_path = log_dir().join("audio-sink.log");
-        if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let log_handle = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .ok();
+        let log_handle = open_log_for_append("audio-sink.log").ok();
         let result = run_as_desktop_user(&["pactl", "unload-module", &owner], env)?;
         if let Some(mut handle) = log_handle {
             let _ = handle.write_all(&result.stdout);
@@ -273,24 +328,11 @@ pub fn ensure_audio_sink(env: &BTreeMap<String, String>, channels: Option<u32>) 
             env,
         )?;
         if !result.status.success() {
-            return Err(anyhow!(
-                "failed to create {AUDIO_SINK_NAME} PipeWire sink"
-            ));
+            return Err(anyhow!("failed to create {AUDIO_SINK_NAME} PipeWire sink"));
         }
     }
 
     set_audio_volume(env, channels);
     set_audio_defaults(env);
     Ok(())
-}
-
-pub fn audio_status_summary(env: &BTreeMap<String, String>) -> String {
-    let details = audio_sink_details(env);
-    match details.name {
-        Some(_) => match details.channels {
-            Some(c) => format!("{AUDIO_SINK_NAME} {c}ch"),
-            None => AUDIO_SINK_NAME.to_string(),
-        },
-        None => format!("missing {AUDIO_SINK_NAME}"),
-    }
 }
