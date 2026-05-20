@@ -17,21 +17,30 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
 #define MAX_EI_DEVICES 64
 #define KEY_STATE_BYTES ((KEY_MAX + 8) / 8)
+#define MOMENTARY_ABS_AXES 4
+#define INPUT_FPS_STATE_FILE "arch-sunshine-input-fps"
+#define DEFAULT_INPUT_FPS 60.0
+#define MIN_DYNAMIC_INPUT_HOLD_MS 4
+#define MAX_DYNAMIC_INPUT_HOLD_MS 50
+#define MAX_INPUT_HOLD_OVERRIDE_MS 250
+#define INPUT_HOLD_REFRESH_SECONDS 0.25
 #define PORTAL_DEVICE_KEYBOARD (1 << 0)
 #define PORTAL_DEVICE_POINTER (1 << 1)
 #define PORTAL_DEVICE_TOUCHSCREEN (1 << 2)
 #define PORTAL_DEVICE_ALL (PORTAL_DEVICE_KEYBOARD | PORTAL_DEVICE_POINTER | PORTAL_DEVICE_TOUCHSCREEN)
 
-struct proxy_device {
+struct input_device {
     const struct libevdev_uinput *uinput;
     bool pointer;
     bool keyboard;
+    bool absolute_pointer;
     bool swap_primary_buttons;
     int32_t rel_x;
     int32_t rel_y;
@@ -39,14 +48,22 @@ struct proxy_device {
     int32_t scroll_y;
     bool have_abs_x;
     bool have_abs_y;
+    bool abs_dirty;
     int32_t abs_x;
     int32_t abs_y;
     int32_t abs_min_x;
     int32_t abs_max_x;
     int32_t abs_min_y;
     int32_t abs_max_y;
+    int32_t abs_min_z;
+    int32_t abs_max_z;
+    int32_t abs_min_rz;
+    int32_t abs_max_rz;
+    int32_t momentary_abs_state[MOMENTARY_ABS_AXES];
+    double momentary_abs_pressed_at[MOMENTARY_ABS_AXES];
     uint8_t key_state[KEY_STATE_BYTES];
-    struct proxy_device *next;
+    double key_pressed_at[KEY_MAX + 1];
+    struct input_device *next;
 };
 
 struct eis_sender {
@@ -69,7 +86,7 @@ struct eis_sender {
 };
 
 static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct proxy_device *devices;
+static struct input_device *devices;
 static struct eis_sender sender;
 static bool sender_initialized;
 static bool sender_connected;
@@ -108,6 +125,152 @@ static bool proxy_enabled(void) {
     return env_truthy("ARCH_SUNSHINE_LIBEI_INPUT", "1");
 }
 
+static bool parse_int_clamped(const char *value, int minimum, int maximum, int *out) {
+    errno = 0;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    while (end && (*end == ' ' || *end == '\t')) {
+        end++;
+    }
+    if (errno != 0 || end == value || (end && *end != '\0')) {
+        return false;
+    }
+    if (parsed < minimum) {
+        parsed = minimum;
+    }
+    if (parsed > maximum) {
+        parsed = maximum;
+    }
+    *out = (int)parsed;
+    return true;
+}
+
+static bool env_int_clamped(const char *name, int minimum, int maximum, int *out) {
+    const char *value = getenv(name);
+    if (!value || *value == '\0') {
+        return false;
+    }
+    return parse_int_clamped(value, minimum, maximum, out);
+}
+
+static bool parse_fps(const char *value, double *out) {
+    if (!value || *value == '\0') {
+        return false;
+    }
+    errno = 0;
+    char *end = NULL;
+    double parsed = strtod(value, &end);
+    while (end && (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')) {
+        end++;
+    }
+    if (errno != 0 || end == value || (end && *end != '\0') || parsed <= 0.0 || parsed > 240.0) {
+        return false;
+    }
+    *out = parsed;
+    return true;
+}
+
+static bool input_fps_state_path(char *path, size_t size) {
+    const char *override = getenv("ARCH_SUNSHINE_INPUT_FPS_FILE");
+    if (override && *override) {
+        int written = snprintf(path, size, "%s", override);
+        return written > 0 && (size_t)written < size;
+    }
+
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    if (!runtime_dir || !*runtime_dir) {
+        runtime_dir = "/run/user/1000";
+    }
+    int written = snprintf(path, size, "%s/%s", runtime_dir, INPUT_FPS_STATE_FILE);
+    return written > 0 && (size_t)written < size;
+}
+
+static double input_fps(void) {
+    double fps = 0.0;
+    if (parse_fps(getenv("ARCH_SUNSHINE_INPUT_FPS"), &fps)) {
+        return fps;
+    }
+
+    char path[PATH_MAX];
+    if (input_fps_state_path(path, sizeof(path))) {
+        FILE *file = fopen(path, "r");
+        if (file) {
+            char text[64];
+            if (fgets(text, sizeof(text), file) && parse_fps(text, &fps)) {
+                fclose(file);
+                return fps;
+            }
+            fclose(file);
+        }
+    }
+
+    if (parse_fps(getenv("SUNSHINE_CLIENT_FPS"), &fps) ||
+        parse_fps(getenv("SUNSHINE_FPS"), &fps)) {
+        return fps;
+    }
+
+    return DEFAULT_INPUT_FPS;
+}
+
+static int dynamic_input_hold_ms(void) {
+    double frame_ms = 1000.0 / input_fps();
+    int hold_ms = (int)frame_ms;
+    if ((double)hold_ms < frame_ms) {
+        hold_ms++;
+    }
+    hold_ms++;
+    if (hold_ms < MIN_DYNAMIC_INPUT_HOLD_MS) {
+        hold_ms = MIN_DYNAMIC_INPUT_HOLD_MS;
+    }
+    if (hold_ms > MAX_DYNAMIC_INPUT_HOLD_MS) {
+        hold_ms = MAX_DYNAMIC_INPUT_HOLD_MS;
+    }
+    return hold_ms;
+}
+
+static int input_min_hold_ms(void) {
+    static int cached = -1;
+    static double last_refresh = 0.0;
+
+    int override = 0;
+    if (env_int_clamped("ARCH_SUNSHINE_INPUT_MIN_HOLD_MS", 0, MAX_INPUT_HOLD_OVERRIDE_MS, &override)) {
+        return override;
+    }
+
+    double now = monotonic_seconds();
+    if (cached < 0 || now - last_refresh >= INPUT_HOLD_REFRESH_SECONDS) {
+        cached = dynamic_input_hold_ms();
+        last_refresh = now;
+    }
+    return cached;
+}
+
+static void sleep_seconds(double seconds) {
+    if (seconds <= 0.0) {
+        return;
+    }
+
+    struct timespec remaining = {
+        .tv_sec = (time_t)seconds,
+        .tv_nsec = (long)((seconds - (time_t)seconds) * 1000000000.0),
+    };
+    while (nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {
+    }
+}
+
+static void apply_min_hold(double pressed_at) {
+    int min_hold_ms = input_min_hold_ms();
+    if (min_hold_ms <= 0 || pressed_at <= 0.0) {
+        return;
+    }
+
+    double elapsed = monotonic_seconds() - pressed_at;
+    double minimum = (double)min_hold_ms / 1000.0;
+    if (elapsed < minimum) {
+        sleep_seconds(minimum - elapsed);
+    }
+}
+
 static void log_message(const char *message) {
     fprintf(stderr, "arch-sunshine-libei-input: %s\n", message);
     fflush(stderr);
@@ -133,7 +296,7 @@ static bool resolve_real_symbols(void) {
            real_libevdev_uinput_destroy;
 }
 
-static bool key_state_changed(struct proxy_device *device, uint32_t code, bool pressed) {
+static bool key_state_changed(struct input_device *device, uint32_t code, bool pressed) {
     if (code > KEY_MAX) {
         return true;
     }
@@ -147,10 +310,74 @@ static bool key_state_changed(struct proxy_device *device, uint32_t code, bool p
     }
     if (pressed) {
         *state |= mask;
+        device->key_pressed_at[code] = monotonic_seconds();
     } else {
+        apply_min_hold(device->key_pressed_at[code]);
         *state &= (uint8_t)~mask;
+        device->key_pressed_at[code] = 0.0;
     }
     return true;
+}
+
+static bool momentary_abs_axis(const struct input_device *device, uint32_t code, int *index, int32_t *neutral, bool *digital) {
+    *neutral = 0;
+    *digital = false;
+    if (code == ABS_HAT0X) {
+        *index = 0;
+        *digital = true;
+        return true;
+    }
+    if (code == ABS_HAT0Y) {
+        *index = 1;
+        *digital = true;
+        return true;
+    }
+    if (code == ABS_Z) {
+        *index = 2;
+        *neutral = device->abs_min_z;
+        return true;
+    }
+    if (code == ABS_RZ) {
+        *index = 3;
+        *neutral = device->abs_min_rz;
+        return true;
+    }
+    return false;
+}
+
+static void hold_momentary_abs_release(struct input_device *device, uint32_t code, int32_t value) {
+    int index = -1;
+    int32_t neutral = 0;
+    bool digital = false;
+    if (!momentary_abs_axis(device, code, &index, &neutral, &digital) ||
+        device->momentary_abs_state[index] == value) {
+        return;
+    }
+
+    bool was_pressed = device->momentary_abs_state[index] != neutral;
+    bool pressed = value != neutral;
+    if (!was_pressed && pressed) {
+        device->momentary_abs_pressed_at[index] = monotonic_seconds();
+    } else if (was_pressed && pressed) {
+        if (digital) {
+            apply_min_hold(device->momentary_abs_pressed_at[index]);
+        }
+        device->momentary_abs_pressed_at[index] = monotonic_seconds();
+    } else if (was_pressed && !pressed) {
+        apply_min_hold(device->momentary_abs_pressed_at[index]);
+        device->momentary_abs_pressed_at[index] = 0.0;
+    }
+    device->momentary_abs_state[index] = value;
+}
+
+static double clamp_double(double value, double minimum, double maximum) {
+    if (value < minimum) {
+        return minimum;
+    }
+    if (value > maximum) {
+        return maximum;
+    }
+    return value;
 }
 
 static void eis_sender_init(struct eis_sender *target) {
@@ -471,8 +698,8 @@ static void eis_move_relative(int32_t dx, int32_t dy) {
     }
 }
 
-static void eis_move_absolute(struct proxy_device *device) {
-    if (!sender.pointer_abs || !device->have_abs_x || !device->have_abs_y) {
+static void eis_move_absolute(struct input_device *device) {
+    if (!sender.pointer_abs || !device->have_abs_x || !device->have_abs_y || !device->abs_dirty) {
         return;
     }
     if (device->abs_max_x <= device->abs_min_x ||
@@ -490,21 +717,36 @@ static void eis_move_absolute(struct proxy_device *device) {
                       ((double)(device->abs_y - device->abs_min_y) /
                        (double)(device->abs_max_y - device->abs_min_y)) *
                           (double)(sender.region_height - 1);
+    target_x = clamp_double(target_x, sender.region_x, sender.region_x + sender.region_width - 1);
+    target_y = clamp_double(target_y, sender.region_y, sender.region_y + sender.region_height - 1);
     ei_device_pointer_motion_absolute(sender.pointer_abs, target_x, target_y);
     eis_frame(sender.pointer_abs);
+    device->abs_dirty = false;
 }
 
-static void eis_button(uint32_t code, bool pressed) {
-    if (sender.button) {
-        ei_device_button_button(sender.button, code, pressed);
-        eis_frame(sender.button);
+static struct ei_device *eis_pointer_device_for_source(const struct input_device *device) {
+    if (device->absolute_pointer && sender.pointer_abs) {
+        return sender.pointer_abs;
+    }
+    if (!device->absolute_pointer && sender.pointer) {
+        return sender.pointer;
+    }
+    return sender.button ? sender.button : sender.scroll;
+}
+
+static void eis_button(const struct input_device *device, uint32_t code, bool pressed) {
+    struct ei_device *target = eis_pointer_device_for_source(device);
+    if (target && ei_device_has_capability(target, EI_DEVICE_CAP_BUTTON)) {
+        ei_device_button_button(target, code, pressed);
+        eis_frame(target);
     }
 }
 
-static void eis_scroll(int32_t dx, int32_t dy) {
-    if (sender.scroll && (dx || dy)) {
-        ei_device_scroll_discrete(sender.scroll, dx, dy);
-        eis_frame(sender.scroll);
+static void eis_scroll(const struct input_device *device, int32_t dx, int32_t dy) {
+    struct ei_device *target = eis_pointer_device_for_source(device);
+    if (target && ei_device_has_capability(target, EI_DEVICE_CAP_SCROLL) && (dx || dy)) {
+        ei_device_scroll_discrete(target, dx, dy);
+        eis_frame(target);
     }
 }
 
@@ -515,7 +757,7 @@ static void eis_key(uint32_t code, bool pressed) {
     }
 }
 
-static void flush_device(struct proxy_device *device) {
+static void flush_device(struct input_device *device) {
     if (device->rel_x || device->rel_y) {
         eis_move_relative(device->rel_x, device->rel_y);
         device->rel_x = 0;
@@ -523,15 +765,23 @@ static void flush_device(struct proxy_device *device) {
     }
     eis_move_absolute(device);
     if (device->scroll_x || device->scroll_y) {
-        eis_scroll(device->scroll_x, device->scroll_y);
+        eis_scroll(device, device->scroll_x, device->scroll_y);
         device->scroll_x = 0;
         device->scroll_y = 0;
     }
 }
 
-static void handle_event(struct proxy_device *device, unsigned int type, unsigned int code, int value) {
-    if (!ensure_eis_connected()) {
-        return;
+static void discard_pointer_frame(struct input_device *device) {
+    device->rel_x = 0;
+    device->rel_y = 0;
+    device->scroll_x = 0;
+    device->scroll_y = 0;
+    device->abs_dirty = false;
+}
+
+static void handle_event(struct input_device *device, unsigned int type, unsigned int code, int value) {
+    if (type == EV_ABS) {
+        hold_momentary_abs_release(device, code, value);
     }
 
     if (type == EV_REL && device->pointer) {
@@ -552,9 +802,11 @@ static void handle_event(struct proxy_device *device, unsigned int type, unsigne
         if (code == ABS_X) {
             device->abs_x = value;
             device->have_abs_x = true;
+            device->abs_dirty = true;
         } else if (code == ABS_Y) {
             device->abs_y = value;
             device->have_abs_y = true;
+            device->abs_dirty = true;
         }
     } else if (type == EV_KEY) {
         if (value != 0 && value != 1) {
@@ -562,6 +814,12 @@ static void handle_event(struct proxy_device *device, unsigned int type, unsigne
         }
         bool pressed = value == 1;
         if (!key_state_changed(device, code, pressed)) {
+            return;
+        }
+        if (!device->pointer && !device->keyboard) {
+            return;
+        }
+        if (!ensure_eis_connected()) {
             return;
         }
         if (code >= BTN_MOUSE && code < BTN_JOYSTICK) {
@@ -575,17 +833,24 @@ static void handle_event(struct proxy_device *device, unsigned int type, unsigne
                     code = BTN_LEFT;
                 }
             }
-            eis_button(code, pressed);
+            eis_button(device, code, pressed);
         } else if (device->keyboard) {
             eis_key(code, pressed);
         }
     } else if (type == EV_SYN && code == SYN_REPORT) {
+        if (!device->pointer) {
+            return;
+        }
+        if (!ensure_eis_connected()) {
+            discard_pointer_frame(device);
+            return;
+        }
         flush_device(device);
     }
 }
 
-static struct proxy_device *find_device(const struct libevdev_uinput *uinput) {
-    for (struct proxy_device *device = devices; device; device = device->next) {
+static struct input_device *find_device(const struct libevdev_uinput *uinput) {
+    for (struct input_device *device = devices; device; device = device->next) {
         if (device->uinput == uinput) {
             return device;
         }
@@ -610,22 +875,30 @@ static void add_device(const struct libevdev *evdev, const struct libevdev_uinpu
                    starts_with(name, "Arch Sunshine Libei Mouse Test");
     bool keyboard = starts_with(name, "Keyboard passthrough") ||
                     starts_with(name, "Arch Sunshine Libei Keyboard Test");
-    if (!pointer && !keyboard) {
-        return;
-    }
 
-    struct proxy_device *device = calloc(1, sizeof(*device));
+    struct input_device *device = calloc(1, sizeof(*device));
     if (!device) {
         return;
     }
     device->uinput = uinput;
     device->pointer = pointer;
     device->keyboard = keyboard;
+    device->absolute_pointer = pointer &&
+                               libevdev_has_event_code(evdev, EV_ABS, ABS_X) &&
+                               libevdev_has_event_code(evdev, EV_ABS, ABS_Y);
     device->swap_primary_buttons = pointer && env_truthy("SUNSHINE_SWAP_PRIMARY_MOUSE_BUTTONS", "1");
     read_abs_info(evdev, ABS_X, &device->abs_min_x, &device->abs_max_x);
     read_abs_info(evdev, ABS_Y, &device->abs_min_y, &device->abs_max_y);
+    read_abs_info(evdev, ABS_Z, &device->abs_min_z, &device->abs_max_z);
+    read_abs_info(evdev, ABS_RZ, &device->abs_min_rz, &device->abs_max_rz);
+    device->momentary_abs_state[2] = device->abs_min_z;
+    device->momentary_abs_state[3] = device->abs_min_rz;
     device->next = devices;
     devices = device;
+
+    if (!pointer && !keyboard) {
+        return;
+    }
 
     if (pointer && keyboard) {
         log_error("proxying virtual pointer and keyboard", name);
@@ -638,9 +911,9 @@ static void add_device(const struct libevdev *evdev, const struct libevdev_uinpu
 }
 
 static void remove_device(const struct libevdev_uinput *uinput) {
-    struct proxy_device **link = &devices;
+    struct input_device **link = &devices;
     while (*link) {
-        struct proxy_device *device = *link;
+        struct input_device *device = *link;
         if (device->uinput != uinput) {
             link = &device->next;
             continue;
@@ -676,11 +949,13 @@ int libevdev_uinput_write_event(const struct libevdev_uinput *uinput_dev, unsign
 
     if (proxy_enabled()) {
         pthread_mutex_lock(&state_lock);
-        struct proxy_device *device = find_device(uinput_dev);
+        struct input_device *device = find_device(uinput_dev);
         if (device) {
             handle_event(device, type, code, value);
         }
+        int result = real_libevdev_uinput_write_event(uinput_dev, type, code, value);
         pthread_mutex_unlock(&state_lock);
+        return result;
     }
 
     return real_libevdev_uinput_write_event(uinput_dev, type, code, value);
@@ -702,7 +977,7 @@ void libevdev_uinput_destroy(struct libevdev_uinput *uinput_dev) {
 __attribute__((destructor)) static void shutdown_libei_input(void) {
     pthread_mutex_lock(&state_lock);
     while (devices) {
-        struct proxy_device *device = devices;
+        struct input_device *device = devices;
         devices = device->next;
         free(device);
     }

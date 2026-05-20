@@ -417,6 +417,13 @@ static void sha256_hex(const char *value, char *target) {
 }
 
 static int seed_web_credentials(void) {
+    const char *user = env_or_default("SUNSHINE_DESKTOP_USER", "sunshine");
+    struct passwd *pw = getpwnam(user);
+    if (!pw) {
+        errno = ENOENT;
+        return -1;
+    }
+
     char salt[33];
     char password[65];
     char password_hash[65];
@@ -458,7 +465,7 @@ static int seed_web_credentials(void) {
     }
 
     (void)chown_path(CREDENTIALS_FILE, 0, 0);
-    (void)chown_path(API_PASSWORD_FILE, 0, 0);
+    failed |= chown_path(API_PASSWORD_FILE, pw->pw_uid, pw->pw_gid) != 0;
     (void)chmod_path(CREDENTIALS_FILE, 0444);
     (void)chmod_path(API_PASSWORD_FILE, 0400);
     (void)chmod_path(CONFIG_DIR, 0555);
@@ -487,7 +494,9 @@ static int command_serve(void) {
         if (keep_caps && grant_sunshine_capabilities() != 0) {
             perror("arch-sunshine-server: grant Sunshine realtime capabilities");
         }
-        setenv("ARCH_SUNSHINE_LIBEI_INPUT", "1", 1);
+        if (!getenv("ARCH_SUNSHINE_LIBEI_INPUT")) {
+            setenv("ARCH_SUNSHINE_LIBEI_INPUT", "1", 1);
+        }
         execl(
             DYNAMIC_LINKER,
             "ld-linux-x86-64.so.2",

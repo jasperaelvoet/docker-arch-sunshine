@@ -71,6 +71,8 @@ pub async fn start_pipewire_stack(
         ));
     }
 
+    // Remove orphaned Sunshine-created sinks from a previous runtime before the
+    // Sunshine process starts tracking its own PulseAudio module IDs.
     cleanup_sunshine_virtual_sinks(env);
     ensure_audio_sink(env, Some(default_audio_channels()))?;
 
@@ -287,7 +289,6 @@ pub fn ensure_audio_sink(env: &BTreeMap<String, String>, channels: Option<u32>) 
     let channel_map = audio_channel_map(channels)
         .ok_or_else(|| anyhow!("unsupported audio channel count: {channels}"))?;
 
-    cleanup_sunshine_virtual_sinks(env);
     let mut details = audio_sink_details(env);
     if details.name.is_some() && details.channels != Some(channels) {
         let Some(owner) = details.owner_module.clone() else {

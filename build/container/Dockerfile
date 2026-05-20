@@ -54,19 +54,13 @@ RUN printf '\nDisableSandbox\n\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n
     && pacman-key --populate archlinux \
     && pacman -Syy --noconfirm archlinux-keyring \
     && pacman -Syu --noconfirm --needed \
-      ark \
-      avahi \
       breeze \
       breeze-icons \
       curl \
       dbus \
       desktop-file-utils \
       dolphin \
-      filelight \
       firefox \
-      foot \
-      grim \
-      gwenview \
       gst-libav \
       gst-plugin-pipewire \
       gst-plugin-qsv \
@@ -77,20 +71,11 @@ RUN printf '\nDisableSandbox\n\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n
       gst-plugins-good \
       gst-plugins-ugly \
       gstreamer \
-      htop \
       intel-media-driver \
       intel-media-sdk \
-      jack2 \
-      kate \
-      kcalc \
       kactivitymanagerd \
       kde-cli-tools \
-      kdf \
-      khelpcenter \
-      kinfocenter \
       kio-extras \
-      ksystemlog \
-      konsole \
       kscreen \
       kwin \
       libcap \
@@ -103,7 +88,6 @@ RUN printf '\nDisableSandbox\n\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n
       lib32-vulkan-radeon \
       libpulse \
       libva-intel-driver \
-      libva-mesa-driver \
       libva-utils \
       libei \
       libx11 \
@@ -113,30 +97,21 @@ RUN printf '\nDisableSandbox\n\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n
       libxtst \
       mesa \
       mesa-utils \
-      miniupnpc \
-      nano \
       noto-fonts \
       noto-fonts-emoji \
       numactl \
-      okular \
       openssl \
       opus \
       plasma-desktop \
       plasma-integration \
-      plasma-systemmonitor \
       plasma-workspace \
       procps-ng \
-      plasma-nm \
       plasma-pa \
-      python-cryptography \
       python-dbus \
       python-gobject \
-      qt6-multimedia-ffmpeg \
       seatd \
       shared-mime-info \
-      spectacle \
       steam \
-      systemsettings \
       vpl-gpu-rt \
       vulkan-icd-loader \
       vulkan-intel \
@@ -157,9 +132,6 @@ RUN printf '\nDisableSandbox\n\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n
     && groupadd -f render \
     && useradd -m -u 1000 -s /bin/bash -G video,input,render sunshine \
     && printf 'sunshine:sunshine\n' | chpasswd \
-    && pacman -Scc --noconfirm
-
-RUN pacman -S --noconfirm --needed weston \
     && pacman -Scc --noconfirm
 
 RUN pacman -S --noconfirm --needed \
@@ -216,6 +188,13 @@ RUN install -d -m 1777 /var/lib/xkb \
     && rm -f \
       /usr/share/applications/dev.lizardbyte.app.Sunshine.desktop \
       /usr/share/applications/dev.lizardbyte.app.Sunshine.terminal.desktop \
+      /usr/share/applications/kaccess.desktop \
+      /usr/share/applications/kcm_*.desktop \
+      /usr/share/applications/kdesystemsettings.desktop \
+      /usr/share/applications/org.kde.kmenuedit.desktop \
+      /usr/share/applications/org.kde.knetattach.desktop \
+      /usr/share/applications/org.kde.plasma.emojier.desktop \
+      /usr/share/applications/systemsettings.desktop \
     && if [ -f /usr/share/applications/dev.lizardbyte.app.Sunshine.kwin.desktop ]; then \
       sed -i '/^Hidden=/d;/^NoDisplay=/d' /usr/share/applications/dev.lizardbyte.app.Sunshine.kwin.desktop; \
       printf '\nNoDisplay=true\n' >> /usr/share/applications/dev.lizardbyte.app.Sunshine.kwin.desktop; \

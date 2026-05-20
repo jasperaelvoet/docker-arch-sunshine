@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::desktop::process::{
@@ -26,6 +28,26 @@ pub fn ensure_desktop_user() -> Result<()> {
 
 fn path_is_mountpoint(path: &Path) -> bool {
     run_quiet(&["mountpoint", "-q", path.to_str().unwrap_or("")])
+}
+
+fn is_event_node_name(name: &OsStr) -> bool {
+    name.to_str()
+        .map(|name| name.starts_with("event"))
+        .unwrap_or(false)
+}
+
+fn input_event_dev(event_path: &Path) -> Option<libc::dev_t> {
+    let text = fs::read_to_string(event_path.join("dev")).ok()?;
+    let (major_text, minor_text) = text.trim().split_once(':')?;
+    let major: u64 = major_text.parse().ok()?;
+    let minor: u64 = minor_text.parse().ok()?;
+    Some(libc::makedev(major as _, minor as _))
+}
+
+fn device_node_matches(path: &Path, dev: libc::dev_t) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_char_device() && meta.rdev() == dev as u64)
+        .unwrap_or(false)
 }
 
 pub fn bind_persistent_home() -> Result<()> {
@@ -62,31 +84,49 @@ pub fn sync_input_device_nodes() -> bool {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .map(|e| e.path())
-            .filter(|p| p.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with("event")).unwrap_or(false))
+            .filter(|p| p.file_name().map(is_event_node_name).unwrap_or(false))
             .collect(),
         Err(_) => return false,
     };
     let mut entries = entries;
     entries.sort();
+    let mut live_nodes: HashSet<OsString> = HashSet::new();
 
     for event_path in entries {
-        let dev_file = event_path.join("dev");
-        let Ok(text) = fs::read_to_string(&dev_file) else { continue };
-        let trimmed = text.trim();
-        let Some((major_text, minor_text)) = trimmed.split_once(':') else { continue };
-        let Ok(major): Result<u64, _> = major_text.parse() else { continue };
-        let Ok(minor): Result<u64, _> = minor_text.parse() else { continue };
-        let Some(name) = event_path.file_name() else { continue };
+        let Some(dev) = input_event_dev(&event_path) else {
+            continue;
+        };
+        let Some(name) = event_path.file_name() else {
+            continue;
+        };
+        live_nodes.insert(name.to_os_string());
         let node = input_dir.join(name);
-        if !node.exists() {
+
+        if node.exists() && !device_node_matches(&node, dev) {
+            if fs::remove_file(&node).is_ok() {
+                changed = true;
+            }
+        }
+        if !device_node_matches(&node, dev) {
             use nix::sys::stat::{mknod, Mode, SFlag};
-            let dev: libc::dev_t = libc::makedev(major as _, minor as _);
             if mknod(&node, SFlag::S_IFCHR, Mode::from_bits_truncate(0o666), dev).is_ok() {
                 changed = true;
             }
         }
         let _ = fs::set_permissions(&node, fs::Permissions::from_mode(0o666));
     }
+
+    if let Ok(rd) = fs::read_dir(input_dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            if is_event_node_name(&name) && !live_nodes.contains(&name) {
+                if fs::remove_file(entry.path()).is_ok() {
+                    changed = true;
+                }
+            }
+        }
+    }
+
     changed
 }
 

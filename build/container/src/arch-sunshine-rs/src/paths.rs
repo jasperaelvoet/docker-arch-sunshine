@@ -10,9 +10,11 @@ pub const USER_DATA: &str = "/mnt/user_data";
 pub const DEFAULT_RUNTIME_DIR: &str = "/run/user/1000";
 pub const DEFAULT_SOCKET: &str = "arch-sunshine-wayland";
 pub const CONTROL_FIFO_NAME: &str = "arch-sunshine-control.fifo";
+pub const INPUT_FPS_STATE_NAME: &str = "arch-sunshine-input-fps";
 pub const DISCONNECT_DESKTOP_ID: &str = "arch-sunshine-disconnect.desktop";
 
 pub const SUNSHINE_CONFIG_DIR: &str = "/run/arch-sunshine/sunshine";
+pub const SUNSHINE_API_USER: &str = "arch-sunshine-locked";
 
 pub const KWIN_OUTPUT_NAMES: &[&str] = &["Virtual-0", "ArchSunshine"];
 
@@ -59,6 +61,10 @@ pub fn sunshine_state_dir() -> PathBuf {
     Path::new(USER_DATA).join("var").join("lib").join("sunshine")
 }
 
+pub fn sunshine_api_password_file() -> PathBuf {
+    Path::new(SUNSHINE_CONFIG_DIR).join("api-password")
+}
+
 pub fn disconnect_desktop_file() -> PathBuf {
     home_dir()
         .join(".local")
@@ -78,4 +84,8 @@ pub fn control_fifo_path(runtime_dir: Option<&Path>) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from(DEFAULT_RUNTIME_DIR))
     });
     dir.join(CONTROL_FIFO_NAME)
+}
+
+pub fn input_fps_state_path(runtime_dir: &Path) -> PathBuf {
+    runtime_dir.join(INPUT_FPS_STATE_NAME)
 }

@@ -5,6 +5,7 @@ STEAM_REAL="${SUNSHINE_STEAM_REAL:-/usr/bin/steam}"
 STEAM_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/Steam"
 STEAM_BOOTSTRAP_TAR=/usr/share/arch-sunshine/steam/bootstraplinux_ubuntu12_32.tar.xz
 STEAM_DEV_CFG="${HOME}/.steam/steam/steam_dev.cfg"
+STEAM_OPEN_MAIN_URL="${SUNSHINE_STEAM_OPEN_MAIN_URL:-steam://open/main}"
 
 ensure_steam_bootstrap() {
   if [ -x "${STEAM_DIR}/steam.sh" ]; then
@@ -30,6 +31,18 @@ ensure_steam_links() {
   ln -sfn "${STEAM_DIR}/linux32" "${HOME}/.steam/sdk32"
   ln -sfn "${STEAM_DIR}/linux64" "${HOME}/.steam/sdk64"
   ln -sfn "${HOME}/.steam/bin32" "${HOME}/.steam/bin"
+}
+
+steam_is_running() {
+  pgrep -u "$(id -u)" -x steam >/dev/null 2>&1 ||
+    pgrep -u "$(id -u)" -x steamwebhelper >/dev/null 2>&1
+}
+
+clear_stale_steam_ipc() {
+  if steam_is_running; then
+    return 0
+  fi
+
   rm -f "${HOME}/.steam/steam.pid" "${HOME}/.steam/steam.pipe" "${HOME}/.steam/steam.token"
 }
 
@@ -76,10 +89,19 @@ export RES_OPTIONS="timeout:1 attempts:2 rotate single-request-reopen"
 
 ensure_steam_bootstrap
 ensure_steam_links
+steam_was_running=0
+if steam_is_running; then
+  steam_was_running=1
+fi
+clear_stale_steam_ipc
 configure_steam_defaults
 clear_steam_offline_state
 
 steam_args=("$@")
+if [ "${steam_was_running}" -eq 1 ] && [ "${#steam_args[@]}" -eq 0 ]; then
+  steam_args=("${STEAM_OPEN_MAIN_URL}")
+fi
+
 has_tcp=0
 for arg in "${steam_args[@]}"; do
   if [ "${arg}" = "-tcp" ]; then

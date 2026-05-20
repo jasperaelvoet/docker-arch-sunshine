@@ -8,8 +8,8 @@ use crate::paths::log_dir;
 
 #[derive(Clone)]
 pub struct Credentials {
-    pub user: String,
-    pub password: String,
+    pub user: Option<String>,
+    pub password: Option<String>,
 }
 
 struct Shutdown {
@@ -65,7 +65,9 @@ impl LogoutPrompt {
 
 fn trigger_disconnect(creds: Credentials) {
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = crate::sunshine_api::disconnect(&creds.user, &creds.password) {
+        if let Err(e) =
+            crate::sunshine_api::disconnect(creds.user.as_deref(), creds.password.as_deref())
+        {
             log_failure(&e.to_string());
         }
     });
@@ -106,5 +108,18 @@ pub async fn run(creds: Credentials) -> Result<()> {
         _ = sigterm.recv() => {}
         _ = sigint.recv() => {}
     }
+    Ok(())
+}
+
+pub async fn request_disconnect() -> Result<()> {
+    let conn = zbus::Connection::session().await?;
+    conn.call_method(
+        Some("org.kde.Shutdown"),
+        "/Shutdown",
+        Some("org.kde.Shutdown"),
+        "Logout",
+        &(),
+    )
+    .await?;
     Ok(())
 }

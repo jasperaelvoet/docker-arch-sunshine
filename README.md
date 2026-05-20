@@ -71,6 +71,11 @@ regenerated as read-only container-owned files on each start.
 - Sunshine capture: `SUNSHINE_CAPTURE`, default `kwin`; set `auto` to let Sunshine choose
 - Sunshine encoder: `SUNSHINE_ENCODER`, default `vaapi`; set `auto` to let Sunshine choose
 - Sunshine gamepad: fixed to `xone` on Linux, the supported Xbox-style virtual pad
+- KWin EIS input mirror: `ARCH_SUNSHINE_LIBEI_INPUT`, default `1`; set `0` only for raw uinput testing
+- Input minimum hold: dynamic by default from the active stream FPS; set
+  `ARCH_SUNSHINE_INPUT_MIN_HOLD_MS` only to force an override, including `0`
+  for raw passthrough. Applies to keys, mouse buttons, controller buttons,
+  D-pad, and trigger taps.
 
 Runtime package changes are intentionally blocked. Add or remove system packages
 in `build/container/Dockerfile`, then rebuild the image. Steam is seeded from

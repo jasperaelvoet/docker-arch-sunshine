@@ -12,7 +12,9 @@ pub mod session_actions;
 use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Child;
@@ -23,8 +25,8 @@ use crate::env_config::{
     sanitize_positive_int, sanitize_refresh_rate,
 };
 use crate::paths::{
-    control_fifo_path, DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_RUNTIME_DIR, DEFAULT_SOCKET,
-    DEFAULT_WIDTH,
+    control_fifo_path, input_fps_state_path, DEFAULT_FPS, DEFAULT_HEIGHT, DEFAULT_RUNTIME_DIR,
+    DEFAULT_SOCKET, DEFAULT_WIDTH,
 };
 
 #[derive(Debug, Clone)]
@@ -117,6 +119,7 @@ pub struct DesktopState {
     pub args: Arc<DesktopArgs>,
     pub geometry: Arc<Mutex<StreamGeometry>>,
     pub audio_channels: Arc<Mutex<u32>>,
+    pub audio_generation: Arc<AtomicU64>,
     pub compositor_env: Arc<BTreeMap<String, String>>,
     pub desktop_env: Arc<BTreeMap<String, String>>,
     pub processes: Arc<Mutex<DesktopProcesses>>,
@@ -199,6 +202,7 @@ pub async fn start(args: DesktopArgs) -> Result<(DesktopState, ShutdownGuard)> {
         fps: args.fps.clone(),
         scale: args.scale.clone(),
     }));
+    write_input_fps_state(&runtime_dir, &args.fps);
 
     compositor::start_desktop_stack(
         &args,
@@ -239,6 +243,7 @@ pub async fn start(args: DesktopArgs) -> Result<(DesktopState, ShutdownGuard)> {
         args: Arc::new(args),
         geometry,
         audio_channels: Arc::new(Mutex::new(default_audio_channels())),
+        audio_generation: Arc::new(AtomicU64::new(0)),
         compositor_env,
         desktop_env,
         processes: Arc::new(Mutex::new(processes)),
@@ -333,7 +338,10 @@ pub async fn handle_control(state: &DesktopState, msg: control::ControlMessage) 
             }
             *current_channels = channels;
             drop(current_channels);
-            pipewire::ensure_audio_sink(&state.desktop_env, Some(channels))?;
+            let generation = state.audio_generation.fetch_add(1, Ordering::SeqCst) + 1;
+            if !state.args.no_audio {
+                pipewire::ensure_audio_sink(&state.desktop_env, Some(channels))?;
+            }
 
             let fps_text = match fps {
                 serde_json::Value::String(s) => s,
@@ -365,13 +373,15 @@ pub async fn handle_control(state: &DesktopState, msg: control::ControlMessage) 
                 let _ = fs::write(&path, "ok\n");
                 process::chown_path(&path, false);
             }
-            schedule_audio_sink_cleanup(state, channels);
+            schedule_audio_sink_cleanup(state, channels, generation);
         }
         control::ControlMessage::ClientStop { .. } => {
-            let channels = default_audio_channels();
-            *state.audio_channels.lock().await = channels;
-            pipewire::ensure_audio_sink(&state.desktop_env, Some(channels))?;
-            schedule_audio_sink_cleanup(state, channels);
+            let generation = state.audio_generation.fetch_add(1, Ordering::SeqCst) + 1;
+            let channels = *state.audio_channels.lock().await;
+            if !state.args.no_audio {
+                pipewire::ensure_audio_sink(&state.desktop_env, Some(channels))?;
+            }
+            schedule_audio_sink_cleanup(state, channels, generation);
             let (width, height, fps, scale) = default_geometry();
             restart_geometry(
                 state,
@@ -388,11 +398,12 @@ pub async fn handle_control(state: &DesktopState, msg: control::ControlMessage) 
     Ok(())
 }
 
-fn schedule_audio_sink_cleanup(state: &DesktopState, channels: u32) {
+fn schedule_audio_sink_cleanup(state: &DesktopState, channels: u32, generation: u64) {
     if state.args.no_audio {
         return;
     }
     let env = state.desktop_env.clone();
+    let current_generation = state.audio_generation.clone();
     tokio::spawn(async move {
         for delay in [
             Duration::from_millis(750),
@@ -400,6 +411,10 @@ fn schedule_audio_sink_cleanup(state: &DesktopState, channels: u32) {
             Duration::from_secs(5),
         ] {
             tokio::time::sleep(delay).await;
+            // A newer client start/stop owns the sink state now.
+            if current_generation.load(Ordering::SeqCst) != generation {
+                return;
+            }
             let env = env.clone();
             let _ = tokio::task::spawn_blocking(move || {
                 if let Err(e) = pipewire::ensure_audio_sink(&env, Some(channels)) {
@@ -420,6 +435,9 @@ async fn restart_geometry(
     scale: String,
     reason: &str,
 ) -> Result<()> {
+    let fps = sanitize_refresh_rate(&fps, DEFAULT_FPS);
+    write_input_fps_state(&state.args.runtime_dir, &fps);
+
     let mut geometry = state.geometry.lock().await;
     let kwin_alive = state
         .processes
@@ -466,4 +484,12 @@ async fn restart_geometry(
     )
     .await?;
     Ok(())
+}
+
+fn write_input_fps_state(runtime_dir: &std::path::Path, fps: &str) {
+    let path = input_fps_state_path(runtime_dir);
+    if fs::write(&path, format!("{fps}\n")).is_ok() {
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+        process::chown_path(&path, false);
+    }
 }

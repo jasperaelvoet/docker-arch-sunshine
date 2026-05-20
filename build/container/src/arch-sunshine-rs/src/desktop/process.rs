@@ -232,8 +232,6 @@ pub fn kill_desktop_processes() {
     let _ = run_checked(&[
         "pkill",
         "-TERM",
-        "-u",
-        &DESKTOP_UID.to_string(),
         "-f",
         "/usr/local/bin/arch-sunshine session-actions",
     ]);

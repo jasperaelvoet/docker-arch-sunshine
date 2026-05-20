@@ -37,6 +37,7 @@ sync_once() {
       --exclude 'mnt/' \
       --exclude 'data/' \
       --exclude 'external/' \
+      --exclude 'build/container/src/arch-sunshine-rs/target/' \
       --exclude '*.log' \
       --exclude '__pycache__/' \
       --exclude '*.pyc' \
@@ -55,6 +56,7 @@ sync_once() {
     --exclude './mnt' \
     --exclude './data' \
     --exclude './external' \
+    --exclude './build/container/src/arch-sunshine-rs/target' \
     --exclude './*.log' \
     --exclude './__pycache__' \
     --exclude './*.pyc' \
@@ -80,6 +82,7 @@ fingerprint() {
       -o -path './mnt' \
       -o -path './data' \
       -o -path './external' \
+      -o -path './build/container/src/arch-sunshine-rs/target' \
       -o -path './__pycache__' \) -prune \
     -o -type f \
       ! -name '.DS_Store' \

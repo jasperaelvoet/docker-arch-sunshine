@@ -19,11 +19,11 @@
         </entry>
         <entry name="favorites" type="StringList">
             <label>List of general favorites. Supported values are menu id's (usually .desktop file names), special URLs that expand into default applications (e.g. preferred://browser), document URLs and KPeople contact URIs.</label>
-            <default>preferred://browser,org.kde.kontact.desktop,systemsettings.desktop,org.kde.dolphin.desktop,org.kde.discover.desktop</default>
+            <default>firefox.desktop,org.kde.dolphin.desktop,steam.desktop</default>
         </entry>
         <entry name="systemFavorites" type="StringList">
             <label>List of system action favorites.</label>
-            <default>suspend,hibernate,reboot,shutdown</default>
+            <default></default>
         </entry>
         <entry name="primaryActions" type="Int">
             <label>Which actions should be displayed in the footer: 0 = Power, 1 = Session, 2 = Custom, 3 = Power and session</label>
@@ -35,7 +35,7 @@
         </entry>
         <entry name="systemApplications" type="StringList">
             <label>List of applications at the top of the "Computer" tab.</label>
-            <default>systemsettings.desktop,org.kde.kinfocenter.desktop,org.kde.discover.desktop</default>
+            <default></default>
         </entry>
         <entry name="paneSwap" type="Bool">
             <label>Whether to swap the sidebar and content panes</label>

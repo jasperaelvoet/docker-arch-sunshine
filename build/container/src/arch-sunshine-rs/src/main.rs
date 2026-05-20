@@ -57,18 +57,18 @@ enum Command {
     ClientStop,
     /// Close the active Moonlight stream.
     Disconnect {
-        #[arg(long, env = "SUNSHINE_WEB_UI_USER", default_value = "sunshine")]
-        user: String,
-        #[arg(long, env = "SUNSHINE_WEB_UI_PASS", default_value = "sunshine")]
-        password: String,
+        #[arg(long, env = "SUNSHINE_WEB_UI_USER")]
+        user: Option<String>,
+        #[arg(long, env = "SUNSHINE_WEB_UI_PASS")]
+        password: Option<String>,
     },
     /// (internal) KDE D-Bus shutdown/logout proxy.
     #[command(name = "session-actions", hide = true)]
     SessionActions {
-        #[arg(long, env = "SUNSHINE_WEB_UI_USER", default_value = "sunshine")]
-        user: String,
-        #[arg(long, env = "SUNSHINE_WEB_UI_PASS", default_value = "sunshine")]
-        password: String,
+        #[arg(long, env = "SUNSHINE_WEB_UI_USER")]
+        user: Option<String>,
+        #[arg(long, env = "SUNSHINE_WEB_UI_PASS")]
+        password: Option<String>,
     },
 }
 
@@ -159,7 +159,9 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::DesktopSession(args) => desktop_session(args).await,
         Command::ClientStart => client_start(),
         Command::ClientStop => client_stop(),
-        Command::Disconnect { user, password } => disconnect(&user, &password),
+        Command::Disconnect { user, password } => {
+            disconnect(user.as_deref(), password.as_deref()).await
+        }
         Command::SessionActions { user, password } => {
             desktop::session_actions::run(Credentials { user, password }).await
         }
@@ -176,10 +178,6 @@ fn probe(config_path: &std::path::Path) -> Result<()> {
     payload.insert(
         "gst_launch".to_string(),
         serde_json::Value::Bool(which::which("gst-launch-1.0")),
-    );
-    payload.insert(
-        "weston".to_string(),
-        serde_json::Value::Bool(which::which("weston")),
     );
     payload.insert(
         "vainfo".to_string(),
@@ -290,8 +288,20 @@ fn client_stop() -> Result<()> {
     Ok(())
 }
 
-fn disconnect(user: &str, password: &str) -> Result<()> {
-    sunshine_api::disconnect(user, password)?;
+async fn disconnect(user: Option<&str>, password: Option<&str>) -> Result<()> {
+    match sunshine_api::resolve_credentials(user, password) {
+        Ok(credentials) => sunshine_api::disconnect_with_credentials(&credentials)?,
+        Err(credentials_error) if user.is_none() && password.is_none() => {
+            desktop::session_actions::request_disconnect()
+                .await
+                .with_context(|| {
+                    format!(
+                        "direct Sunshine credentials unavailable ({credentials_error}); session service fallback failed"
+                    )
+                })?;
+        }
+        Err(credentials_error) => return Err(credentials_error),
+    }
     client_stop()
 }
 
