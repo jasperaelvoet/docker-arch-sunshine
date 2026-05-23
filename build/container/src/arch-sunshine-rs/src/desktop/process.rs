@@ -17,7 +17,7 @@ pub fn start_child_reaper() {
             .name("arch-sunshine-reaper".into())
             .spawn(|| loop {
                 reap_orphaned_children();
-                std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(Duration::from_secs(5));
             });
     });
 }

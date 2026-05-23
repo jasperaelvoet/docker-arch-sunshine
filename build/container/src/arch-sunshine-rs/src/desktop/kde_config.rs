@@ -159,12 +159,17 @@ pub fn apply_kde_session_tweaks(env: &BTreeMap<String, String>) {
 
     run_kwriteconfig(env, "kdeglobals", &["KDE"], "AnimationDurationFactor", "0");
     run_kwriteconfig(env, "kwinrc", &["Compositing"], "AnimationSpeed", "0");
+    let latency_policy = std::env::var("SUNSHINE_KWIN_LATENCY_POLICY")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "Low".into());
     run_kwriteconfig(
         env,
         "kwinrc",
         &["Compositing"],
         "LatencyPolicy",
-        "ExtremelyLow",
+        &latency_policy,
     );
     run_kwriteconfig(env, "kwinrc", &["Compositing"], "GLPreferBufferSwap", "a");
     for plugin in [

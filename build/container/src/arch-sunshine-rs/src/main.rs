@@ -94,12 +94,12 @@ struct PipelineArgs {
     height: u32,
     #[arg(long, env = "SUNSHINE_FPS", default_value = "60")]
     fps: u32,
-    #[arg(long, env = "SUNSHINE_BITRATE_KBPS", default_value = "25000")]
+    #[arg(long, env = "SUNSHINE_BITRATE_KBPS", default_value = "50000")]
     bitrate: u32,
     #[arg(
         long = "vbv-buffer",
         env = "SUNSHINE_VBV_KBITS",
-        default_value = "25000"
+        default_value = "50000"
     )]
     vbv_buffer: u32,
     #[arg(
@@ -341,20 +341,14 @@ async fn desktop_session(args: DesktopSessionArgs) -> Result<()> {
 async fn run_headless(state: desktop::DesktopState, guard: desktop::ShutdownGuard) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let mut ticker = tokio::time::interval(Duration::from_millis(250));
     loop {
         tokio::select! {
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
-            _ = ticker.tick() => {
-                let mut control_lock = guard.control.lock().await;
-                if let Some(ch) = control_lock.as_mut() {
-                    let messages = ch.read_messages().await;
-                    drop(control_lock);
-                    for msg in messages {
-                        if let Err(e) = desktop::handle_control(&state, msg).await {
-                            eprintln!("arch-sunshine: control error: {e}");
-                        }
+            messages = desktop::read_control_messages(&guard) => {
+                for msg in messages {
+                    if let Err(e) = desktop::handle_control(&state, msg).await {
+                        eprintln!("arch-sunshine: control error: {e}");
                     }
                 }
             }

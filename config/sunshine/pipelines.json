@@ -1,7 +1,7 @@
 {
   "defaults": {
-    "bitrate_kbps": 25000,
-    "vbv_buffer_kbits": 25000,
+    "bitrate_kbps": 50000,
+    "vbv_buffer_kbits": 50000,
     "payload_mtu": 1200
   },
   "video_sources": {

@@ -274,7 +274,15 @@ static int write_config(void) {
         "audio_sink = arch_sunshine_audio\n"
         "gamepad = xone\n"
         "motion_as_ds4 = disabled\n"
-        "touchpad_as_ds4 = disabled\n");
+        "touchpad_as_ds4 = disabled\n"
+        "qp = 24\n"
+        "nvenc_preset = 4\n"
+        "qsv_preset = slow\n"
+        "qsv_coder = cabac\n"
+        "amd_usage = lowlatency_high_quality\n"
+        "amd_quality = quality\n"
+        "vaapi_strict_rc_buffer = disabled\n"
+        "vk_tune = 1\n");
 
     if (write_capture) {
         fprintf(file, "capture = %s\n", capture);

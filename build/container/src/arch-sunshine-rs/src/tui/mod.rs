@@ -19,7 +19,7 @@ use std::os::fd::IntoRawFd;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::desktop::{handle_control, DesktopState, ShutdownGuard};
+use crate::desktop::{handle_control, read_control_messages, DesktopState, ShutdownGuard};
 use crate::encoder::{chosen_encoder_summary, load_config};
 use crate::env_config::kwin_virtual_geometry;
 use crate::tui::keys::KeyAction;
@@ -109,8 +109,6 @@ async fn run_loop(
     fast_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut slow_ticker = tokio::time::interval(Duration::from_secs(10));
     slow_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut control_ticker = tokio::time::interval(Duration::from_millis(250));
-    control_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut shell_ticker = tokio::time::interval(Duration::from_millis(33));
     shell_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -200,8 +198,12 @@ async fn run_loop(
                 app.status.audio_sink = audio;
                 app.status.encoder_summary = encoders;
             }
-            _ = control_ticker.tick() => {
-                pump_control(state, guard).await;
+            messages = read_control_messages(guard) => {
+                for msg in messages {
+                    if let Err(e) = handle_control(state, msg).await {
+                        eprintln!("arch-sunshine: control error: {e}");
+                    }
+                }
             }
             _ = shell_ticker.tick(), if app.modal == Modal::Shell => {
                 // wakes the loop so the embedded shell redraws PTY output;
@@ -210,20 +212,6 @@ async fn run_loop(
         }
     }
     Ok(())
-}
-
-async fn pump_control(state: &DesktopState, guard: &ShutdownGuard) {
-    let mut control_lock = guard.control.lock().await;
-    let Some(channel) = control_lock.as_mut() else {
-        return;
-    };
-    let messages = channel.read_messages().await;
-    drop(control_lock);
-    for msg in messages {
-        if let Err(e) = handle_control(state, msg).await {
-            eprintln!("arch-sunshine: control error: {e}");
-        }
-    }
 }
 
 async fn build_fast_status(state: &DesktopState) -> StatusSnapshot {

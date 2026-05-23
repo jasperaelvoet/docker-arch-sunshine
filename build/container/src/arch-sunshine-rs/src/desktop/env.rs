@@ -52,12 +52,23 @@ pub fn desktop_base_env(
         "PULSE_SERVER".into(),
         format!("unix:{}/pulse/native", runtime_dir.display()),
     );
-    env.insert("PIPEWIRE_DEBUG".into(), "1".into());
-    env.insert("PIPEWIRE_LOG".into(), "1".into());
-    env.insert("WIREPLUMBER_LOG_LEVEL".into(), "2".into());
     env.insert("STEAM_RUNTIME".into(), "1".into());
     env.insert("SRT_URLOPEN_PREFER_STEAM".into(), "1".into());
     env.insert("STEAM_DISABLE_AUDIO_DEVICE_SWITCHING".into(), "1".into());
+
+    if let Ok(level) = std::env::var("ARCH_SUNSHINE_PIPEWIRE_DEBUG") {
+        let trimmed = level.trim();
+        if !trimmed.is_empty() {
+            env.insert("PIPEWIRE_DEBUG".into(), trimmed.into());
+            env.insert("PIPEWIRE_LOG".into(), "1".into());
+        }
+    }
+    if let Ok(level) = std::env::var("ARCH_SUNSHINE_WIREPLUMBER_LOG_LEVEL") {
+        let trimmed = level.trim();
+        if !trimmed.is_empty() {
+            env.insert("WIREPLUMBER_LOG_LEVEL".into(), trimmed.into());
+        }
+    }
 
     if let Ok(compose) = std::env::var("SUNSHINE_KWIN_COMPOSE") {
         let trimmed = compose.trim();

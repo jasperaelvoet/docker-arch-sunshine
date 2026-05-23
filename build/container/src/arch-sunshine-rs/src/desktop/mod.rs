@@ -304,6 +304,15 @@ impl ShutdownGuard {
     }
 }
 
+pub async fn read_control_messages(guard: &ShutdownGuard) -> Vec<control::ControlMessage> {
+    let mut control_lock = guard.control.lock().await;
+    let Some(channel) = control_lock.as_mut() else {
+        std::future::pending::<()>().await;
+        return Vec::new();
+    };
+    channel.read_messages().await
+}
+
 fn start_network_status() -> Option<Child> {
     let bin = std::path::Path::new("/usr/local/bin/arch-sunshine-network-status");
     if !bin.exists() {

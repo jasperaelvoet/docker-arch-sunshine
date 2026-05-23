@@ -70,6 +70,10 @@ regenerated as read-only container-owned files on each start.
 - Sunshine RTSP/media/control ports: `48010`, `47998`, `48000`, `47999`
 - Sunshine capture: `SUNSHINE_CAPTURE`, default `kwin`; set `auto` to let Sunshine choose
 - Sunshine encoder: `SUNSHINE_ENCODER`, default `vaapi`; set `auto` to let Sunshine choose
+- Sunshine quality: lower QP fallback and higher quality GPU presets are enabled
+  by default; the Moonlight client bitrate still controls normal stream bitrate
+- Diagnostic RTP pipeline bitrate: `SUNSHINE_BITRATE_KBPS`, default `50000`
+- KWin latency policy: `SUNSHINE_KWIN_LATENCY_POLICY`, default `Low`
 - Sunshine gamepad: fixed to `xone` on Linux, the supported Xbox-style virtual pad
 - KWin EIS input mirror: `ARCH_SUNSHINE_LIBEI_INPUT`, default `1`; set `0` only for raw uinput testing
 - Input minimum hold: dynamic by default from the active stream FPS; set
